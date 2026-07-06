@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+develop-eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env
+
+# PyTorch / CUDA build artifacts
+*.so
+*.o
+*.obj
+*.cubin
+*.ptx
+*.fatbin
+.pytorch_jit_cache/
+torch_extensions/
+
+# Test / cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local scratch / experiment outputs
+scratch/
+tmp/
+*.tmp
