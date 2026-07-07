@@ -1,0 +1,7 @@
+# 运行环境依赖。
+# GPU 环境：Google Colab 免费版通常已预装 torch(cu*) 与 numpy，无需重装。
+# 本地（无 GPU）仅用于写代码/git，不需要安装这些。
+#
+# 版本下限对齐 Colab 实测环境（torch 2.11.0+cu128, numpy 2.0.2, Python 3.12）。
+torch>=2.4
+numpy>=1.26
