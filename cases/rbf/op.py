@@ -28,14 +28,14 @@ class RBFFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, X, Y, gamma):
         K = _fwd_module().rbf_forward(X, Y, float(gamma))
-        ctx.save_for_backward(X, Y)
+        ctx.save_for_backward(X, Y, K)   # 缓存 K 供反向复用，免重算 dist/exp
         ctx.gamma = float(gamma)
         return K
 
     @staticmethod
     def backward(ctx, G):
-        X, Y = ctx.saved_tensors
-        dX, dY = _bwd_module().rbf_backward(X, Y, G.contiguous(), ctx.gamma)
+        X, Y, K = ctx.saved_tensors
+        dX, dY = _bwd_module().rbf_backward(X, Y, G.contiguous(), K, ctx.gamma)
         return dX, dY, None
 
 
