@@ -9,16 +9,24 @@
 约定：
 - 所有实现（参考 / kernel）与计时都从本文件取形状，避免不一致。
 - 参考实现必须用"自然广播形式"表达，见 rbf_reference.py（保赢面，不走 GEMM 分解）。
+
+形状可切换（应对不同显存）：
+- 默认 N=M=2048，广播中间量 [2048,2048,64]×4B ≈ 1GB，反向峰值 ~3-4GB，T4(16GB) 稳过。
+- 升级到 ≥24GB 卡后，设环境变量 RBF_SIZE=4096 即可恢复大形状，无需改代码。
 """
 
-from dataclasses import dataclass, field
+import os
+from dataclasses import dataclass
+
+
+_SIZE = int(os.environ.get("RBF_SIZE", "2048"))   # N=M，默认 2048（T4 安全）；升卡后设 4096
 
 
 @dataclass(frozen=True)
 class RBFConfig:
-    # 验收主用例形状
-    N: int = 4096          # X 行数
-    M: int = 4096          # Y 行数
+    # 验收主用例形状（N=M 由环境变量 RBF_SIZE 控制，默认 2048）
+    N: int = _SIZE         # X 行数
+    M: int = _SIZE         # Y 行数
     D: int = 64            # 特征维度
     gamma: float = 1.0 / 64.0   # RBF 带宽系数：K = exp(-gamma * dist^2)；取 1/D 使 exp 输入落在合理数值区间
     dtype: str = "float32"      # 验收精度（禁止降精度换速度）
@@ -50,6 +58,7 @@ def summary() -> str:
     c = CONFIG
     return (
         f"RBF kernel matrix | X:[{c.N},{c.D}] Y:[{c.M},{c.D}] -> K:[{c.N},{c.M}] "
+        f"(RBF_SIZE={_SIZE}) "
         f"| gamma={c.gamma:.6g} dtype={c.dtype} "
         f"| tol(atol={c.atol},rtol={c.rtol}) seeds={c.seeds} "
         f"| bench(warmup={c.warmup},iters={c.iters},repeats={c.repeats},"
