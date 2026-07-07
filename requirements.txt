@@ -5,3 +5,5 @@
 # 版本下限对齐 Colab 实测环境（torch 2.11.0+cu128, numpy 2.0.2, Python 3.12）。
 torch>=2.4
 numpy>=1.26
+# ninja: torch cpp_extension 的 JIT 编译后端（Colab 默认未装，需 pip install）
+ninja>=1.11
