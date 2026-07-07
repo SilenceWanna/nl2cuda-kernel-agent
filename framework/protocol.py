@@ -21,6 +21,7 @@ class Protocol:
     iters: int = 100                 # 正式测量 ≥100，取几何均值
     repeats: int = 3                 # 重跑次数，算 CV
     cv_threshold: float = 0.05       # CV > 5% 作废重测
+    max_retries: int = 4             # CV 超阈值时自动重测的最大次数（防共享环境噪声）
 
     # 达标阈值：自定义 kernel 相对 torch.compile 前反向均需 ≥1.05x
     speedup_target: float = 1.05

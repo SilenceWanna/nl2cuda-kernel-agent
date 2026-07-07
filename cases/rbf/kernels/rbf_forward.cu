@@ -53,16 +53,29 @@ __global__ void rbf_forward_kernel(
         __syncthreads();
 
         int dlim = min(TD, D - d0);
+        // 内层用 float4 向量化读 shared（TD=32 → 8 个 float4）。dlim 为 TD 的常见情形走向量化路径。
         #pragma unroll
         for (int a = 0; a < RN; ++a) {
             int xr = ty + a * TY;           // Xs 行 (0..31)
+            const float4* xs4 = reinterpret_cast<const float4*>(&Xs[xr][0]);
             #pragma unroll
             for (int b = 0; b < RM; ++b) {
                 int yr = tx + b * TX;       // Ys 行 (0..31)
+                const float4* ys4 = reinterpret_cast<const float4*>(&Ys[yr][0]);
                 float acc = 0.0f;
-                for (int dd = 0; dd < dlim; ++dd) {
-                    float diff = Xs[xr][dd] - Ys[yr][dd];
-                    acc += diff * diff;
+                if (dlim == TD) {
+                    #pragma unroll
+                    for (int q = 0; q < TD / 4; ++q) {
+                        float4 xv = xs4[q], yv = ys4[q];
+                        float d0f = xv.x - yv.x, d1f = xv.y - yv.y;
+                        float d2f = xv.z - yv.z, d3f = xv.w - yv.w;
+                        acc += d0f*d0f + d1f*d1f + d2f*d2f + d3f*d3f;
+                    }
+                } else {
+                    for (int dd = 0; dd < dlim; ++dd) {
+                        float diff = Xs[xr][dd] - Ys[yr][dd];
+                        acc += diff * diff;
+                    }
                 }
                 dist[a][b] += acc;
             }

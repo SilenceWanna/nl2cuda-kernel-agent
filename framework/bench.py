@@ -72,6 +72,23 @@ def _summarize(kind, geomeans, cv_threshold):
             "cv": cv, "ok": cv <= cv_threshold}
 
 
+def _collect_with_retry(kind, one_round):
+    """反复测 repeats 轮算 CV；CV 超阈值则自动重测（最多 max_retries 次），
+    取所有尝试中 CV 最小的一组，降低共享环境（如 Colab）测量噪声导致的误判。
+    one_round(): 返回一次 repeats 轮的 geomeans 列表。"""
+    p = PROTOCOL
+    best = None
+    for attempt in range(p.max_retries + 1):
+        geomeans = one_round()
+        s = _summarize(kind, geomeans, p.cv_threshold)
+        s["attempts"] = attempt + 1
+        if best is None or s["cv"] < best["cv"]:
+            best = s
+        if s["ok"]:
+            break
+    return best
+
+
 def _forward_geomean_cv(fn, inputs, params):
     p = PROTOCOL
     detached = {k: v.detach() for k, v in inputs.items()}
@@ -80,8 +97,10 @@ def _forward_geomean_cv(fn, inputs, params):
         with torch.no_grad():
             fn(detached, params)
 
-    geomeans = [_geomean(_measure(step, p.warmup, p.iters)) for _ in range(p.repeats)]
-    return _summarize("forward", geomeans, p.cv_threshold)
+    def one_round():
+        return [_geomean(_measure(step, p.warmup, p.iters)) for _ in range(p.repeats)]
+
+    return _collect_with_retry("forward", one_round)
 
 
 def _backward_geomean_cv(fn, inputs, params, grad_inputs, G):
@@ -100,9 +119,11 @@ def _backward_geomean_cv(fn, inputs, params, grad_inputs, G):
             out.backward(G)
         return do_bwd
 
-    geomeans = [_geomean(_measure_backward(build_graph, p.warmup, p.iters))
+    def one_round():
+        return [_geomean(_measure_backward(build_graph, p.warmup, p.iters))
                 for _ in range(p.repeats)]
-    return _summarize("backward", geomeans, p.cv_threshold)
+
+    return _collect_with_retry("backward", one_round)
 
 
 def compare(case, candidate, device=None, seed=0):
@@ -132,9 +153,11 @@ def compare(case, candidate, device=None, seed=0):
         results[name] = (fres, bres)
         lines.append(f"\n[{name}]")
         lines.append(f"  forward : {fres['geomean_ms']:.4f} ms  "
-                     f"CV={fres['cv']*100:.2f}%  {'ok' if fres['ok'] else 'CV超阈值!'}")
+                     f"CV={fres['cv']*100:.2f}%  x{fres['attempts']}  "
+                     f"{'ok' if fres['ok'] else 'CV超阈值!'}")
         lines.append(f"  backward: {bres['geomean_ms']:.4f} ms  "
-                     f"CV={bres['cv']*100:.2f}%  {'ok' if bres['ok'] else 'CV超阈值!'}")
+                     f"CV={bres['cv']*100:.2f}%  x{bres['attempts']}  "
+                     f"{'ok' if bres['ok'] else 'CV超阈值!'}")
 
     (bf, bb) = results["baseline(torch.compile)"]
     (cf, cb) = results["candidate"]
