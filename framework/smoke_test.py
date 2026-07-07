@@ -1,9 +1,9 @@
 """编译链路冒烟测试：在 Colab(T4) 上编译 smoke.cu 并验证 vadd 正确。
 
 用法：
-    python kernels/smoke_test.py
+    python framework/smoke_test.py
 
-通过 = nvcc + torch cpp_extension + sm_75 编译链路 OK，可以放心写真正的 RBF kernel。
+通过 = nvcc + torch cpp_extension + sm_75 编译链路 OK，可以放心写真正的 kernel。
 """
 
 import sys
@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch  # noqa: E402
 
-from kernels.loader import load_kernel  # noqa: E402
+from framework.loader import load_kernel  # noqa: E402
 
 
 def main():

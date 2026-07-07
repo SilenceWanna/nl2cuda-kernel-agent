@@ -14,7 +14,7 @@ import torch
 from torch.utils.cpp_extension import load
 
 
-KERNELS_DIR = os.path.dirname(os.path.abspath(__file__))
+FRAMEWORK_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 针对 T4(sm_75) 的默认编译参数。-O3 常规优化；不含 fast-math。
 DEFAULT_CUDA_FLAGS = [
@@ -24,20 +24,24 @@ DEFAULT_CUDA_FLAGS = [
 DEFAULT_CPP_FLAGS = ["-O3"]
 
 
-def load_kernel(name, sources, extra_cuda_cflags=None, extra_cflags=None, verbose=True):
+def load_kernel(name, sources, base_dir=None, extra_cuda_cflags=None,
+                extra_cflags=None, verbose=True):
     """即时编译并加载一个 CUDA 扩展。
 
     name: 扩展模块名（须唯一，用于构建缓存目录）。
-    sources: .cu / .cpp 源文件名列表（相对 kernels/ 目录，或绝对路径）。
+    sources: .cu / .cpp 源文件名列表（绝对路径，或相对 base_dir）。
+    base_dir: 相对源文件的基准目录；默认 framework/（用于 smoke.cu）。
+              各 case 应传入自己的 kernels 目录，如 cases/rbf/kernels。
     extra_cuda_cflags: 追加到默认 CUDA 编译参数之后的额外参数。
     返回：已加载的扩展模块对象。
     """
     if not torch.cuda.is_available():
         raise RuntimeError("需要 CUDA GPU 才能编译/加载 kernel（本地无 GPU，请在 Colab 运行）")
 
+    base = base_dir if base_dir is not None else FRAMEWORK_DIR
     resolved = []
     for s in sources:
-        p = s if os.path.isabs(s) else os.path.join(KERNELS_DIR, s)
+        p = s if os.path.isabs(s) else os.path.join(base, s)
         if not os.path.exists(p):
             raise FileNotFoundError(f"源文件不存在: {p}")
         resolved.append(p)

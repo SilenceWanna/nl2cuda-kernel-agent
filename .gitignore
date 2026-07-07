@@ -40,3 +40,6 @@ Thumbs.db
 scratch/
 tmp/
 *.tmp
+
+# Claude Code 本地会话设置
+.claude/

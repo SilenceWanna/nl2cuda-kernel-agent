@@ -22,13 +22,13 @@
 
 ## 目录结构
 
+两层架构：**通用框架**（算法无关）+ **算法 case**（每算法一份，可替换）。RBF 是第一个 case，后续加新算法只需新增 `cases/<name>/`。
+
 | 路径 | 用途 |
 |------|------|
-| `reference/` | PyTorch 参考实现 + 验收用例配置（正确性金标准） |
-| `tests/` | 正确性验证器（allclose + gradcheck） |
-| `benchmarks/` | 计时基准器（CUDA events，对比 torch.compile）；**只读、进程隔离** |
-| `kernels/` | 手写 CUDA kernel（管线自检 + skill 参考解）与编译加载脚手架 |
-| `skill/` | 交付的 skill：方法论 `SKILL.md` + 工具 `scripts/` + loop 驱动 |
+| `framework/` | 通用框架（**算法无关**）：`protocol.py` 计时/容差协议、`case.py` Case 协议、`verify.py` 正确性验证、`bench.py` 计时、`loader.py` 编译加载、`smoke.cu` 冒烟。**评测脚本对 agent 只读、进程隔离** |
+| `cases/<name>/` | 算法 case：`__init__.py`(暴露 CASE)、`reference.py` 金标准、`config.py` 形状/参数、`description.md` NL 描述、`kernels/` CUDA kernel、`op.py` autograd 封装 |
+| `skill/` | 交付的 skill：`DESIGN.md` 设计、`SKILL.md` 方法论、`loop.md` 迭代循环、`scripts/` 通用 CLI（`verify_case.py`/`bench_case.py --case <name>`） |
 | `notebooks/` | Colab 驱动 notebook（clone/pull + 装依赖 + 运行入口） |
 | `scripts/` | 通用脚本（如 `probe_env.py` 环境探测） |
 
