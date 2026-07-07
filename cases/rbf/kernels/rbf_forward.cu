@@ -1,26 +1,13 @@
-// RBF 前向 kernel（阶段3 v4：tiling+coarsening，exp 实现可编译期切换用于诊断）。
+// RBF 前向 kernel（阶段3：tiling + coarsening + float4，精确 expf）。
 //   X:[N,D], Y:[M,D]；Dist[i,j]=sum_d (X[i,d]-Y[j,d])^2；K[i,j]=exp(-gamma*Dist[i,j])
 //
-// 前向瓶颈已确证为 expf（compute-bound）。本版保留最快的 tiling+coarsening 访存策略，
-// 并用 RBF_FAST_EXP 宏在精确 expf() 与快速内联 __expf() 间切换，用于测量二者的
-// 加速幅度与 allclose 精度影响（默认精确 expf，保守）。
-//   编译期 -DRBF_FAST_EXP=1 启用 __expf。
+// 优化历程：朴素4.8ms → tiling(1024线程)4.5 → coarsening(256线程/block)2.34 → +float4 2.27ms。
+// 主要收益来自提高 occupancy（256线程/block + 每线程2×2输出微块）。
+// 经测量前向瓶颈非 expf（__expf 不提速），保持精确 expf（防作弊最干净）。fp32 全精度。
 
 #include <torch/extension.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
-
-#ifndef RBF_FAST_EXP
-#define RBF_FAST_EXP 0
-#endif
-
-__device__ __forceinline__ float rbf_exp(float x) {
-#if RBF_FAST_EXP
-    return __expf(x);      // 快速内联，走 SFU MUFU.EX2，末位精度略低
-#else
-    return expf(x);        // 精确
-#endif
-}
 
 #define BN 32
 #define BM 32
@@ -99,7 +86,7 @@ __global__ void rbf_forward_kernel(
         for (int b = 0; b < RM; ++b) {
             int gc = col0 + tx + b * TX;
             if (gr < N && gc < M)
-                K[(size_t)gr * M + gc] = rbf_exp(-gamma * dist[a][b]);
+                K[(size_t)gr * M + gc] = expf(-gamma * dist[a][b]);
         }
     }
 }
