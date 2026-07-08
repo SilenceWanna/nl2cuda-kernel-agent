@@ -16,11 +16,23 @@ from torch.utils.cpp_extension import load
 
 FRAMEWORK_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 针对 T4(sm_75) 的默认编译参数。-O3 常规优化；不含 fast-math。
-DEFAULT_CUDA_FLAGS = [
-    "-O3",
-    "-gencode", "arch=compute_75,code=sm_75",
-]
+# 目标 GPU 架构：默认同时为 sm_75(T4/Turing) 与 sm_80(A100/Ampere) 生成，
+# 使同一份 kernel 在两类卡上都能跑。可用环境变量 CUDA_ARCHS 覆盖，
+# 例如 CUDA_ARCHS="80" 只为 A100 编译（更快），"75" 只为 T4。
+_ARCHS = os.environ.get("CUDA_ARCHS", "75,80").split(",")
+
+
+def _arch_flags():
+    flags = []
+    for a in _ARCHS:
+        a = a.strip()
+        if a:
+            flags += ["-gencode", f"arch=compute_{a},code=sm_{a}"]
+    return flags
+
+
+# -O3 常规优化；不含 fast-math（守正确性/防作弊"禁止降精度换速度"）。
+DEFAULT_CUDA_FLAGS = ["-O3"] + _arch_flags()
 DEFAULT_CPP_FLAGS = ["-O3"]
 
 
