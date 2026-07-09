@@ -1,11 +1,12 @@
-"""Softmax 交叉熵 kernel 的候选实现封装（dict 接口，符合 framework 候选契约）。
+"""Softmax cross-entropy candidate implementation (dict interface).
 
-candidate(inputs, params) -> 标量 loss，对 inputs["logits"] 提供梯度（labels 整型不求）。
-kernel 源在 cases/softmax_ce/kernels/，float32-only（labels int64）。
+candidate(inputs, params) -> scalar loss, with gradients for inputs["logits"] only.
+CUDA kernels live in cases/softmax_ce/kernels/ and are compiled through
+framework.loader. float32-only; labels are int64 and non-differentiable.
 """
 
-import os
 import functools
+import os
 
 import torch
 
@@ -32,14 +33,17 @@ class SoftmaxCEFunction(torch.autograd.Function):
         return loss
 
     @staticmethod
-    def backward(ctx, gout):
+    def backward(ctx, grad_out):
         logits, labels = ctx.saved_tensors
-        # gout 是标量上游梯度；传给 kernel（保证 contiguous 的 1 元素张量）
-        g = gout.reshape(1).contiguous()
-        dlogits = _bwd_module().softmax_ce_backward(logits, labels, g)
-        return dlogits, None      # 对应 (logits, labels)；labels 不求梯度
+        dlogits = _bwd_module().softmax_ce_backward(logits, labels, grad_out.contiguous())
+        return dlogits, None
 
 
 def candidate(inputs, params):
-    """framework 候选契约：inputs={"logits","labels"} -> 标量 loss。"""
+    """framework candidate contract: inputs={"logits","labels"}, params={} -> scalar loss."""
     return SoftmaxCEFunction.apply(inputs["logits"], inputs["labels"])
+
+
+def forward_only(inputs, params):
+    """Forward-only helper for debugging/forward checks."""
+    return _fwd_module().softmax_ce_forward(inputs["logits"], inputs["labels"])

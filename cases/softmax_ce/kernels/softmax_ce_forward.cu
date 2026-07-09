@@ -1,69 +1,97 @@
-// Softmax 交叉熵 —— 前向 kernel（block-per-row，数值稳定 logsumexp）。
-//   logits:[B,C], labels:[B] -> 标量 loss = mean_b( logsumexp(logits[b,:]) - logits[b,labels[b]] )
+// Softmax cross-entropy forward kernel, fp32, numerically stable logsumexp.
+// logits:[B,C] float32, labels:[B] int64 -> scalar mean loss.
 //
-// 一个 block 处理一行 b：blockDim 个线程 grid-stride 遍历 C 个类别，
-// block 内规约求 max（数值稳定）与 sum(exp(logit-max))，得 logsumexp；
-// loss_b = logsumexp - logits[b, labels[b]]；atomicAdd 累加到全局 loss（host 端 /B）。
+// One CUDA block handles one row. Threads reduce row max and exp-sum in shared memory,
+// then one thread atomically accumulates the row loss into a scalar initialized to 0.
+// No fast-math flags are used by framework.loader; expf/logf are the regular fp32 funcs.
 
 #include <torch/extension.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-#define THREADS 256
+namespace {
+
+constexpr int THREADS = 256;
 
 __global__ void softmax_ce_forward_kernel(
-        const float* __restrict__ logits,   // [B, C]
-        const long*  __restrict__ labels,   // [B]
-        float* __restrict__ loss_accum,     // [1] 全局累加器
-        int B, int C) {
+        const float* __restrict__ logits,
+        const int64_t* __restrict__ labels,
+        float* __restrict__ loss,
+        int B,
+        int C) {
+    __shared__ float smem[THREADS];
+
     int b = blockIdx.x;
+    int tid = threadIdx.x;
     if (b >= B) return;
+
     const float* row = logits + (size_t)b * C;
 
-    __shared__ float sred[THREADS];
-    int t = threadIdx.x;
-
-    // --- 求行 max ---
-    float lmax = -3.4e38f;
-    for (int c = t; c < C; c += blockDim.x) lmax = fmaxf(lmax, row[c]);
-    sred[t] = lmax; __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (t < s) sred[t] = fmaxf(sred[t], sred[t + s]);
-        __syncthreads();
+    float local_max = -CUDART_INF_F;
+    for (int c = tid; c < C; c += blockDim.x) {
+        local_max = fmaxf(local_max, row[c]);
     }
-    float rowmax = sred[0];
+    smem[tid] = local_max;
     __syncthreads();
 
-    // --- 求 sum(exp(x-max)) ---
-    float lsum = 0.0f;
-    for (int c = t; c < C; c += blockDim.x) lsum += expf(row[c] - rowmax);
-    sred[t] = lsum; __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (t < s) sred[t] += sred[t + s];
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem[tid] = fmaxf(smem[tid], smem[tid + stride]);
+        }
         __syncthreads();
     }
-    if (t == 0) {
-        float logsumexp = rowmax + logf(sred[0]);
-        float loss_b = logsumexp - row[labels[b]];
-        atomicAdd(loss_accum, loss_b);
+    float row_max = smem[0];
+
+    float local_sum = 0.0f;
+    for (int c = tid; c < C; c += blockDim.x) {
+        local_sum += expf(row[c] - row_max);
+    }
+    smem[tid] = local_sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem[tid] += smem[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        int64_t label = labels[b];
+        float chosen = row[label];
+        float row_loss = logf(smem[0]) + row_max - chosen;
+        atomicAdd(loss, row_loss / (float)B);
     }
 }
 
+}  // namespace
+
 torch::Tensor softmax_ce_forward(torch::Tensor logits, torch::Tensor labels) {
-    TORCH_CHECK(logits.is_cuda() && labels.is_cuda(), "inputs must be CUDA");
+    TORCH_CHECK(logits.is_cuda() && labels.is_cuda(), "logits and labels must be CUDA tensors");
     TORCH_CHECK(logits.dtype() == torch::kFloat32, "logits must be float32");
-    TORCH_CHECK(labels.dtype() == torch::kLong, "labels must be int64");
+    TORCH_CHECK(labels.dtype() == torch::kInt64, "labels must be int64");
+    TORCH_CHECK(logits.dim() == 2, "logits must be 2D [B,C]");
+    TORCH_CHECK(labels.dim() == 1, "labels must be 1D [B]");
+    TORCH_CHECK(labels.size(0) == logits.size(0), "labels length must equal B");
+
     logits = logits.contiguous();
     labels = labels.contiguous();
-    int B = logits.size(0), C = logits.size(1);
 
+    int B = (int)logits.size(0);
+    int C = (int)logits.size(1);
     auto loss = torch::zeros({}, logits.options());
+
     softmax_ce_forward_kernel<<<B, THREADS>>>(
-        logits.data_ptr<float>(), labels.data_ptr<long>(),
-        loss.data_ptr<float>(), B, C);
-    return loss / B;   // 对 batch 取平均
+        logits.data_ptr<float>(),
+        labels.data_ptr<int64_t>(),
+        loss.data_ptr<float>(),
+        B,
+        C);
+
+    return loss;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("softmax_ce_forward", &softmax_ce_forward, "Softmax CE forward (CUDA)");
+    m.def("softmax_ce_forward", &softmax_ce_forward,
+          "Softmax cross-entropy forward (CUDA)");
 }
