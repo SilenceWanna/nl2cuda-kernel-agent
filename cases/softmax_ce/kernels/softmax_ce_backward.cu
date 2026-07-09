@@ -8,6 +8,7 @@
 #include <torch/extension.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cfloat>
 
 namespace {
 
@@ -29,7 +30,7 @@ __global__ void softmax_ce_backward_kernel(
     const float* row = logits + (size_t)b * C;
     float* drow = dlogits + (size_t)b * C;
 
-    float local_max = -CUDART_INF_F;
+    float local_max = -FLT_MAX;
     for (int c = tid; c < C; c += blockDim.x) {
         local_max = fmaxf(local_max, row[c]);
     }
