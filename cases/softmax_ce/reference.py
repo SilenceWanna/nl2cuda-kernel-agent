@@ -49,10 +49,9 @@ def make_inputs(seed, dtype, device, requires_grad=False):
     if requires_grad:
         logits.requires_grad_(True)
 
-    params = {}
     inputs = {
         "logits": logits,
         "labels": labels,
     }
 
-    return inputs, params
+    return inputs
