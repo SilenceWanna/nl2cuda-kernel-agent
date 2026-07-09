@@ -4,13 +4,14 @@ from .config import DEFAULT_BATCH, DEFAULT_CLASSES
 
 
 def reference_forward(inputs, params):
-    logits, target = inputs
+    logits = inputs["logits"]
+    labels = inputs["labels"]
 
     logits_f = logits.float()
-    target = target.long()
+    labels = labels.long()
 
     log_z = torch.logsumexp(logits_f, dim=1)
-    correct = logits_f.gather(1, target.view(-1, 1)).squeeze(1)
+    correct = logits_f.gather(1, labels.view(-1, 1)).squeeze(1)
     loss = log_z - correct
 
     return loss.mean()
@@ -36,7 +37,7 @@ def make_inputs(seed, dtype, device, requires_grad=False):
         generator=gen,
     )
 
-    target = torch.randint(
+    labels = torch.randint(
         low=0,
         high=classes,
         size=(batch,),
@@ -49,6 +50,9 @@ def make_inputs(seed, dtype, device, requires_grad=False):
         logits.requires_grad_(True)
 
     params = {}
-    inputs = (logits, target)
+    inputs = {
+        "logits": logits,
+        "labels": labels,
+    }
 
     return inputs, params
