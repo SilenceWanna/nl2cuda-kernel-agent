@@ -1,81 +1,119 @@
-// LayerNorm 前向 kernel（朴素正确版，不追求速度）。
-//   输入 X:[B,D], gamma:[D], beta:[D]；在最后一维 D 归一化。
-//   mean = mean_d X[b,d];  var = mean_d (X[b,d]-mean)^2
-//   Y[b,d] = (X[b,d]-mean)/sqrt(var+eps) * gamma[d] + beta[d]
-//
-// 策略：一个 block 处理一行 b，blockDim=256 个线程协作规约求 mean/var（shared memory），
-// 再各线程写回该行的 Y。朴素但正确；优化留到后续。
-
 #include <torch/extension.h>
-#include <cuda.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
 #include <cuda_runtime.h>
 
+#include <vector>
+
+namespace {
+
+constexpr int THREADS = 256;
+
 __global__ void layernorm_forward_kernel(
-        const float* __restrict__ X,      // [B, D]
-        const float* __restrict__ gamma,  // [D]
-        const float* __restrict__ beta,   // [D]
-        float* __restrict__ Y,            // [B, D]
-        int B, int D, float eps) {
-    int b = blockIdx.x;
-    if (b >= B) return;
-    const float* xrow = X + (size_t)b * D;
-    float* yrow = Y + (size_t)b * D;
+    const float* __restrict__ x,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    float* __restrict__ out,
+    float* __restrict__ mean_out,
+    float* __restrict__ rstd_out,
+    int b,
+    int d,
+    float eps) {
+    __shared__ float shared[THREADS];
 
-    extern __shared__ float sdata[];  // blockDim.x 个元素，用于规约
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= b) {
+        return;
+    }
 
-    // --- 求和 -> mean ---
-    float local = 0.0f;
-    for (int d = threadIdx.x; d < D; d += blockDim.x) local += xrow[d];
-    sdata[threadIdx.x] = local;
+    const float* x_row = x + static_cast<long long>(row) * d;
+
+    float sum = 0.0f;
+    for (int col = tid; col < d; col += THREADS) {
+        sum += x_row[col];
+    }
+    shared[tid] = sum;
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+
+    for (int stride = THREADS / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
         __syncthreads();
     }
-    float mean = sdata[0] / D;
+
+    float mean = shared[0] / static_cast<float>(d);
+
+    float var_sum = 0.0f;
+    for (int col = tid; col < d; col += THREADS) {
+        float centered = x_row[col] - mean;
+        var_sum += centered * centered;
+    }
+    shared[tid] = var_sum;
     __syncthreads();
 
-    // --- 求 (x-mean)^2 之和 -> var ---
-    float localv = 0.0f;
-    for (int d = threadIdx.x; d < D; d += blockDim.x) {
-        float diff = xrow[d] - mean;
-        localv += diff * diff;
-    }
-    sdata[threadIdx.x] = localv;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+    for (int stride = THREADS / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
         __syncthreads();
     }
-    float var = sdata[0] / D;
-    float rstd = rsqrtf(var + eps);
 
-    // --- 写回 ---
-    for (int d = threadIdx.x; d < D; d += blockDim.x) {
-        float xhat = (xrow[d] - mean) * rstd;
-        yrow[d] = xhat * gamma[d] + beta[d];
+    float variance = shared[0] / static_cast<float>(d);
+    float rstd = 1.0f / sqrtf(variance + eps);
+
+    if (tid == 0) {
+        mean_out[row] = mean;
+        rstd_out[row] = rstd;
+    }
+
+    float* out_row = out + static_cast<long long>(row) * d;
+    for (int col = tid; col < d; col += THREADS) {
+        float xhat = (x_row[col] - mean) * rstd;
+        out_row[col] = xhat * gamma[col] + beta[col];
     }
 }
 
-torch::Tensor layernorm_forward(torch::Tensor X, torch::Tensor gamma,
-                                torch::Tensor beta, double eps) {
-    TORCH_CHECK(X.is_cuda() && gamma.is_cuda() && beta.is_cuda(), "inputs must be CUDA");
-    TORCH_CHECK(X.dtype() == torch::kFloat32, "X must be float32");
-    TORCH_CHECK(X.dim() == 2, "X must be 2D [B,D]");
-    X = X.contiguous();
-    gamma = gamma.contiguous();
-    beta = beta.contiguous();
-    int B = X.size(0);
-    int D = X.size(1);
+}  // namespace
 
-    auto Y = torch::empty_like(X);
-    const int threads = 256;
-    layernorm_forward_kernel<<<B, threads, threads * sizeof(float)>>>(
-        X.data_ptr<float>(), gamma.data_ptr<float>(), beta.data_ptr<float>(),
-        Y.data_ptr<float>(), B, D, (float)eps);
-    return Y;
-}
+std::vector<torch::Tensor> layernorm_forward(
+    torch::Tensor x,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    double eps) {
+    TORCH_CHECK(x.is_cuda() && gamma.is_cuda() && beta.is_cuda(),
+                "LayerNorm inputs must be CUDA tensors");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat32 &&
+                gamma.scalar_type() == torch::kFloat32 &&
+                beta.scalar_type() == torch::kFloat32,
+                "LayerNorm only supports float32");
+    TORCH_CHECK(x.dim() == 2, "LayerNorm X must be 2D");
+    TORCH_CHECK(gamma.dim() == 1 && beta.dim() == 1,
+                "LayerNorm gamma and beta must be 1D");
+    TORCH_CHECK(x.is_contiguous() && gamma.is_contiguous() && beta.is_contiguous(),
+                "LayerNorm inputs must be contiguous");
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("layernorm_forward", &layernorm_forward, "LayerNorm forward (CUDA, naive)");
+    int b = static_cast<int>(x.size(0));
+    int d = static_cast<int>(x.size(1));
+    TORCH_CHECK(gamma.size(0) == d && beta.size(0) == d,
+                "LayerNorm gamma/beta shape mismatch");
+
+    auto out = torch::empty_like(x);
+    auto mean = torch::empty({b}, x.options());
+    auto rstd = torch::empty({b}, x.options());
+
+    layernorm_forward_kernel<<<b, THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+        x.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        out.data_ptr<float>(),
+        mean.data_ptr<float>(),
+        rstd.data_ptr<float>(),
+        b,
+        d,
+        static_cast<float>(eps));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return {out, mean, rstd};
 }

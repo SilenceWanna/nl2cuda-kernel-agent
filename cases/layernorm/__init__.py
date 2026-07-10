@@ -1,10 +1,8 @@
-"""LayerNorm case：暴露 CASE 实例供 framework 使用。"""
-
 import os
 
 from framework.case import Case
 from cases.layernorm import config
-from cases.layernorm.reference import reference_forward, make_inputs
+from cases.layernorm.reference import make_inputs, reference_forward
 
 
 def _load_description():
