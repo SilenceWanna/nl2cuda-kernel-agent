@@ -15,6 +15,52 @@ namespace {
     CHECK_FLOAT32(x);  \
     CHECK_CONTIGUOUS(x)
 
+__global__ void rbf_forward_d64_kernel(
+    const float* __restrict__ X,
+    const float* __restrict__ Y,
+    float* __restrict__ K,
+    int N,
+    int M,
+    float gamma) {
+    constexpr int TILE = 16;
+    constexpr int D = 64;
+    constexpr int PAD_D = 65;
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int j = blockIdx.x * TILE + tx;
+    const int i = blockIdx.y * TILE + ty;
+
+    __shared__ float sx[TILE][PAD_D];
+    __shared__ float sy[TILE][PAD_D];
+
+    const int tid = ty * TILE + tx;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int idx = tid + k * TILE * TILE;
+        const int r = idx >> 6;
+        const int d = idx & 63;
+        const int xi = blockIdx.y * TILE + r;
+        const int yj = blockIdx.x * TILE + r;
+        sx[r][d] = (xi < N) ? X[xi * D + d] : 0.0f;
+        sy[r][d] = (yj < M) ? Y[yj * D + d] : 0.0f;
+    }
+    __syncthreads();
+
+    if (i >= N || j >= M) {
+        return;
+    }
+
+    float dist = 0.0f;
+#pragma unroll
+    for (int d = 0; d < D; ++d) {
+        const float diff = sx[ty][d] - sy[tx][d];
+        dist += diff * diff;
+    }
+
+    K[i * M + j] = expf(-gamma * dist);
+}
+
 __global__ void rbf_forward_vec4_kernel(
     const float* __restrict__ X,
     const float* __restrict__ Y,
@@ -106,7 +152,15 @@ torch::Tensor rbf_forward(torch::Tensor X, torch::Tensor Y, double gamma) {
     const dim3 grid((M + BX - 1) / BX, (N + BY - 1) / BY);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    if ((D & 3) == 0) {
+    if (D == 64) {
+        rbf_forward_d64_kernel<<<grid, block, 0, stream>>>(
+            X.data_ptr<float>(),
+            Y.data_ptr<float>(),
+            K.data_ptr<float>(),
+            N,
+            M,
+            static_cast<float>(gamma));
+    } else if ((D & 3) == 0) {
         rbf_forward_vec4_kernel<<<grid, block, 0, stream>>>(
             X.data_ptr<float>(),
             Y.data_ptr<float>(),
