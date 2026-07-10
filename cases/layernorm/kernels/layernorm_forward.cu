@@ -16,21 +16,30 @@ __inline__ __device__ float warp_reduce_sum(float v) {
 
 __inline__ __device__ float block_reduce_sum(float v) {
     __shared__ float shared[32];
+
     const int lane = threadIdx.x & 31;
     const int wid = threadIdx.x >> 5;
+    const int num_warps = (blockDim.x + 31) >> 5;
 
     v = warp_reduce_sum(v);
+
     if (lane == 0) {
         shared[wid] = v;
     }
     __syncthreads();
 
-    v = (threadIdx.x < (blockDim.x >> 5)) ? shared[lane] : 0.0f;
+    v = (threadIdx.x < num_warps) ? shared[lane] : 0.0f;
+
     if (wid == 0) {
         v = warp_reduce_sum(v);
     }
+
+    if (threadIdx.x == 0) {
+        shared[0] = v;
+    }
     __syncthreads();
-    return v;
+
+    return shared[0];
 }
 
 __global__ void layernorm_forward_kernel(
