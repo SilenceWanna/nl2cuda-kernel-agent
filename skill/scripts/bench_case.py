@@ -10,6 +10,7 @@
 
 import sys
 import os
+import re
 import argparse
 import importlib
 
@@ -29,10 +30,38 @@ def load_impl(spec):
     return getattr(importlib.import_module(mod_path), fn_name)
 
 
+def _parse_verdict(report, passed):
+    """从 compare() 的报告文本解析机读摘要。
+
+    passed（来自 framework/bench.compare()，权威）决定 PASS vs BENCH_FAIL；
+    报告中的 "存在 CV>5%" 标记 → cv_ok=0 → CV_INVALID（让调用方重测而非信噪声）。
+    加速比锚在 "x  (需" 上，避免误抓 "... ms" 计时行。
+    返回单行字符串，形如 "VERDICT=PASS fwd=1.09x bwd=1.40x cv_ok=1"。
+    """
+    # 前向/反向加速比行： "  forward : 1.0921x  (需 ≥1.05x) PASS"
+    speedups = re.findall(r"(forward|backward)\s*:\s*([0-9.]+)x\s*\(需", report)
+    sp = {k: v for k, v in speedups}
+    fwd = sp.get("forward", "?")
+    bwd = sp.get("backward", "?")
+    cv_ok = 0 if "存在 CV>5%" in report else 1
+
+    if cv_ok == 0:
+        verdict = "CV_INVALID"
+    elif passed:
+        verdict = "PASS"
+    else:
+        verdict = "BENCH_FAIL"
+    return f"VERDICT={verdict} fwd={fwd}x bwd={bwd}x cv_ok={cv_ok}"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--case", required=True, help="case 名，如 rbf")
     ap.add_argument("--impl", default=None, help="候选实现 module:fn；默认 cases.<case>.op:candidate")
+    ap.add_argument("--strict", action="store_true",
+                    help="达标 exit 0、未达标 exit 1（供自动闭环用退出码判定）")
+    ap.add_argument("--emit-verdict", action="store_true",
+                    help="报告后额外打印单行机读摘要 VERDICT=...")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -46,7 +75,14 @@ def main():
     print(f"case={args.case}  impl={impl_spec}")
     report, passed = compare(case, impl, device="cuda")
     print(report)
-    return 0  # 首次/未达标不视为脚本失败，仅报告
+
+    if args.emit_verdict:
+        print(_parse_verdict(report, passed))
+
+    # 默认行为不变（无 flag 恒 exit 0，仅报告）；--strict 才用退出码表达达标与否。
+    if args.strict:
+        return 0 if passed else 1
+    return 0
 
 
 if __name__ == "__main__":
