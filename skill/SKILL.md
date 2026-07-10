@@ -139,9 +139,13 @@ python skill/scripts/bench_case.py --case <name>
 - 避免大数相消；累加用 float 累加器（即便输出 fp32，规约中间量也别过早截断）。
 
 ### C. 规约模式（mean/var/sum/max/softmax 都用得上）
-- **block-per-row**：一个 block 处理一行/一个样本，block 内多线程 grid-stride 遍历该行，再树形规约（`shared[t]+=shared[t+s]`，`s` 折半，配 `__syncthreads()`）。
+- **block-per-row（行规约）**：一个 block 处理一行/一个样本，block 内多线程 grid-stride 遍历该行，再树形规约（`shared[t]+=shared[t+s]`，`s` 折半，配 `__syncthreads()`）。行主序下这条访存合并、最常用。
 - **warp 规约**：一个 warp 内用 `__shfl_down_sync` 免 shared 往返，更快。
 - **两遍规约**：如 var 需先得 mean 再求平方差和；logsumexp 需先 max 再 sum。行内规约做两趟即可。
+- **列规约（沿行数 B 规约，如 LayerNorm 的 dgamma/dbeta = Σ_b …）——别用"一 block 一列"的朴素写法**：那样同一 warp 的线程读**同列不同行**（跨 B×4 字节大跨步），访存完全不合并，且只有 D 个 block、并行度低，是常见慢点。改用二维分块：
+  - **网格按 (行块 × 列)** 布置，每个 block 覆盖一段行 × 一片连续列，block 内线程按**行主序合并读**（`threadIdx.x` 对应列、连续），在寄存器/shared 里对本行块做部分和；
+  - 多个行块的部分和再**跨 block 累加**（`atomicAdd` 到输出，或第二个 kernel 做行块间归约）。这样既合并访存、又有足够 block 喂满 SM。
+  - 简化可行版：仍一 block 一列但让 block 内线程沿 B 分段、每线程累加多行再 block 内树形规约——比一线程扫全列强，但仍不如二维分块合并访存。
 
 ### D. 访存优化
 - **float4 向量化**：连续维度按 `float4`（或 `reinterpret_cast<const float4*>`）一次读 4 个，减少 load 指令、提升带宽利用。要求 16B 对齐、维度是 4 的倍数。
