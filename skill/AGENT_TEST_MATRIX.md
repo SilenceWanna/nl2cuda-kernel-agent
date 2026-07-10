@@ -123,7 +123,7 @@ CUDA_VISIBLE_DEVICES=<空闲卡> CUDA_ARCHS=80 python skill/scripts/bench_case.p
 | case \ agent | aider | codex | gptme |
 |--------------|-------|-------|-------|
 | RBF          | ✅（精简版重生 PASS，前~2e-7/反~6e-7，用了缓存K复用） | ✅⚡（精简版重生，前1.09×/反1.40×，tiling+coarsening+缓存K，CV<1%） | ✅⚡（重生首轮正确但反0.016×慢63倍；**阶段6自主闭环优化达标 前3.43×/反1.26×**——gptme 凭 VERDICT+日志自主诊断：移除atomicAdd竞争改独立累加、前向加D=64 shared tiling，已独立复验） |
-| LayerNorm    | ✅（5.3 已验证 PASS，自主推导dX耦合项） | ✅⚠️（精简版重生，正确性全PASS+自主推导dX耦合项+二维分块列规约；反1.24×达标，前向@默认B=4096虚高1.2×、放大B=32768摊薄固定开销后0.97×未达标——前向优化留阶段6自主闭环） | ⚠️FAIL（真净房重生，与旧版diff197行原创，结构对+自主推导dX耦合项+二维分块列规约，但block_reduce_sum结果未广播回全线程→前向mean算错→verify FAIL(前err~3500)。真实bug留阶段6自主纠错） |
+| LayerNorm    | ✅（5.3 已验证 PASS，自主推导dX耦合项） | ✅⚠️（精简版重生，正确性全PASS+自主推导dX耦合项+二维分块列规约；反1.24×达标，前向@默认B=4096虚高1.2×、放大B=32768摊薄固定开销后0.97×未达标——前向优化留阶段6自主闭环） | ⚠️→✅正确（重生首轮有block_reduce广播bug致verify FAIL；**阶段6 aider 纠错闭环自主两轮修复**：先backward、再自发现forward同bug均改return shared[0]→verify全PASS。修后暴露前向0.89×未达标(反1.22×达标)，属短核前向优化任务，归codex支线） |
 | Softmax-CE   | ✅⚡（精简版重生，前1.23×/反2.55×，logsumexp减max+单文件.cu+缓存probs，前向前4种子误差0） | ✅⚡（精简版重生，前1.62×/反2.79×，logsumexp减max+template复用+缓存probs；早期非精简版曾1.97/1.80） | ✅⚡（真净房重生，前1.75×/反3.91×，logsumexp减max+block_reduce广播已修+缓存logsumexp反向重算softmax；反向为三agent最快） |
 
 > 注：codex/gptme 此前的 Softmax-CE 达标是在 description 精简**之前**测的；本轮矩阵用精简版重测以对齐。
