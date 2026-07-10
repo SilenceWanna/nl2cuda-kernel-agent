@@ -27,6 +27,13 @@ rm -rf cases/rbf/delivery
 
 每个 agent 用**独立 workdir**（避免并行抢目录），产物推到独立分支 `test/kt-<case>-<agent>`。
 
+> **⚠️ 干净房间必须 commit 空实现（血泪教训）**：仅在工作区删实现文件、不 commit，是**假干净房间**——
+> 因为 main/HEAD 里三个 case 一直带着达标实现，agent 跑 git 操作（或 clone 自 main）会还原出实现，
+> 于是它"抄现成"而非重生（表现：产物与旧版 `git diff` 为 0，verify/bench 全过但无意义）。
+> **正解**：在 workdir 建 cleanroom 分支，`git rm` 实现文件后**提交这个空状态**（`git commit`），
+> 使 HEAD 里 reference/op/kernel 全为 0 字节。这样 agent 无论怎么操作都还原不出实现，只能靠精简 description+skill 自写。
+> 验真伪：agent 产物与旧版 `git diff origin/main -- <kernel>.cu` 应有大量差异（0=又抄了）。
+
 ## 2. 各 Agent 启动方式（均连京东内网 OpenAI 兼容代理 DongCC `127.0.0.1:8787`）
 
 > 京东代理踩坑：`GPT-5.5-joybuilder` 不接受 `temperature`（否则 400）；`DeepSeek-V3` 接受 temperature 但拒 content 数组。按 agent 选模型/配置规避。
@@ -115,7 +122,7 @@ CUDA_VISIBLE_DEVICES=<空闲卡> CUDA_ARCHS=80 python skill/scripts/bench_case.p
 
 | case \ agent | aider | codex | gptme |
 |--------------|-------|-------|-------|
-| RBF          | ✅（精简版重生 PASS，前~2e-7/反~6e-7，用了缓存K复用） | ✅⚡（精简版重生，前1.09×/反1.40×，tiling+coarsening+缓存K，CV<1%） | ⬜ |
+| RBF          | ✅（精简版重生 PASS，前~2e-7/反~6e-7，用了缓存K复用） | ✅⚡（精简版重生，前1.09×/反1.40×，tiling+coarsening+缓存K，CV<1%） | ✅正确/⚠️性能（真净房重生，与旧版diff251行原创，verify全PASS；前1.04×差临门、反0.016×慢63倍——反向shared-mem atomicAdd竞争缺陷，性能留阶段6自主优化） |
 | LayerNorm    | ✅（5.3 已验证 PASS，自主推导dX耦合项） | ✅⚠️（精简版重生，正确性全PASS+自主推导dX耦合项+二维分块列规约；反1.24×达标，前向@默认B=4096虚高1.2×、放大B=32768摊薄固定开销后0.97×未达标——前向优化留阶段6自主闭环） | ⬜ |
 | Softmax-CE   | ✅⚡（精简版重生，前1.23×/反2.55×，logsumexp减max+单文件.cu+缓存probs，前向前4种子误差0） | ✅⚡（精简版重生，前1.62×/反2.79×，logsumexp减max+template复用+缓存probs；早期非精简版曾1.97/1.80） | ⬜ |
 
