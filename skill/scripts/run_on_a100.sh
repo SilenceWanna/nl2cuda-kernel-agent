@@ -71,9 +71,13 @@ fi
 SIZE_ENV="${SIZE_ENV//,/ }"
 
 # ---- (A) 防作弊前置：framework/ 不得被本地改动 ----
+# 用 numstat -w 忽略纯行尾/空白差异（WSL↔Windows checkout 常见 CRLF 视图差异会误判为脏）；
+# 有实际内容改动才拒。--quiet 不支持 -w，故用 numstat 是否有输出判断。
 if git -C "$WORKDIR" rev-parse --git-dir >/dev/null 2>&1; then
-  if ! git -C "$WORKDIR" diff --quiet -- framework/ 2>/dev/null; then
-    echo "framework/ 有未提交改动——评测基座只读，拒绝运行。" >&2
+  FW_DIFF="$(git -C "$WORKDIR" diff --numstat -w -- framework/ 2>/dev/null)"
+  if [ -n "$FW_DIFF" ]; then
+    echo "framework/ 有实质改动——评测基座只读，拒绝运行：" >&2
+    echo "$FW_DIFF" >&2
     emit FRAMEWORK_DIRTY; exit 1
   fi
 fi
