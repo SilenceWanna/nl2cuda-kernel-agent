@@ -1,120 +1,129 @@
-// RBF 前向 kernel（阶段3：tiling + coarsening + float4，精确 expf）。
-//   X:[N,D], Y:[M,D]；Dist[i,j]=sum_d (X[i,d]-Y[j,d])^2；K[i,j]=exp(-gamma*Dist[i,j])
-//
-// 优化历程：朴素4.8ms → tiling(1024线程)4.5 → coarsening(256线程/block)2.34 → +float4 2.27ms。
-// 主要收益来自提高 occupancy（256线程/block + 每线程2×2输出微块）。
-// 经测量前向瓶颈非 expf（__expf 不提速），保持精确 expf（防作弊最干净）。fp32 全精度。
-
 #include <torch/extension.h>
-#include <cuda.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
 #include <cuda_runtime.h>
 
-#define BN 32
-#define BM 32
-#define TD 32
-#define TX 16
-#define TY 16
-#define RN (BN / TY)
-#define RM (BM / TX)
+namespace {
+
+constexpr int TILE_N = 32;
+constexpr int TILE_M = 32;
+constexpr int TILE_D = 32;
+constexpr int THREAD_X = 16;
+constexpr int THREAD_Y = 16;
+constexpr int OUT_N = TILE_N / THREAD_Y;
+constexpr int OUT_M = TILE_M / THREAD_X;
 
 __global__ void rbf_forward_kernel(
-        const float* __restrict__ X,
-        const float* __restrict__ Y,
-        float* __restrict__ K,
-        int N, int M, int D, float gamma) {
-    __shared__ float Xs[BN][TD];
-    __shared__ float Ys[BM][TD];
+    const float* __restrict__ x,
+    const float* __restrict__ y,
+    float* __restrict__ out,
+    int n,
+    int m,
+    int d,
+    float gamma) {
+    __shared__ float xs[TILE_N][TILE_D];
+    __shared__ float ys[TILE_M][TILE_D];
 
-    int ty = threadIdx.y, tx = threadIdx.x;
-    int row0 = blockIdx.y * BN;
-    int col0 = blockIdx.x * BM;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int tid = ty * THREAD_X + tx;
+    int row_base = blockIdx.y * TILE_N;
+    int col_base = blockIdx.x * TILE_M;
 
-    float dist[RN][RM];
-    #pragma unroll
-    for (int a = 0; a < RN; ++a)
-        for (int b = 0; b < RM; ++b) dist[a][b] = 0.0f;
-
-    for (int d0 = 0; d0 < D; d0 += TD) {
-        #pragma unroll
-        for (int idx = ty * TX + tx; idx < BN * TD; idx += TX * TY) {
-            int r = idx / TD, c = idx % TD;
-            int gr = row0 + r, gd = d0 + c;
-            Xs[r][c] = (gr < N && gd < D) ? X[(size_t)gr * D + gd] : 0.0f;
+    float dist[OUT_N][OUT_M];
+#pragma unroll
+    for (int rn = 0; rn < OUT_N; ++rn) {
+#pragma unroll
+        for (int rm = 0; rm < OUT_M; ++rm) {
+            dist[rn][rm] = 0.0f;
         }
-        #pragma unroll
-        for (int idx = ty * TX + tx; idx < BM * TD; idx += TX * TY) {
-            int r = idx / TD, c = idx % TD;
-            int gr = col0 + r, gd = d0 + c;
-            Ys[r][c] = (gr < M && gd < D) ? Y[(size_t)gr * D + gd] : 0.0f;
+    }
+
+    for (int d_base = 0; d_base < d; d_base += TILE_D) {
+        for (int idx = tid; idx < TILE_N * TILE_D; idx += THREAD_X * THREAD_Y) {
+            int r = idx / TILE_D;
+            int c = idx - r * TILE_D;
+            int global_r = row_base + r;
+            int global_d = d_base + c;
+            xs[r][c] = (global_r < n && global_d < d)
+                ? x[static_cast<long long>(global_r) * d + global_d]
+                : 0.0f;
+        }
+        for (int idx = tid; idx < TILE_M * TILE_D; idx += THREAD_X * THREAD_Y) {
+            int r = idx / TILE_D;
+            int c = idx - r * TILE_D;
+            int global_r = col_base + r;
+            int global_d = d_base + c;
+            ys[r][c] = (global_r < m && global_d < d)
+                ? y[static_cast<long long>(global_r) * d + global_d]
+                : 0.0f;
         }
         __syncthreads();
 
-        int dlim = min(TD, D - d0);
-        #pragma unroll
-        for (int a = 0; a < RN; ++a) {
-            int xr = ty + a * TY;
-            const float4* xs4 = reinterpret_cast<const float4*>(&Xs[xr][0]);
-            #pragma unroll
-            for (int b = 0; b < RM; ++b) {
-                int yr = tx + b * TX;
-                const float4* ys4 = reinterpret_cast<const float4*>(&Ys[yr][0]);
+        int d_limit = min(TILE_D, d - d_base);
+#pragma unroll
+        for (int rn = 0; rn < OUT_N; ++rn) {
+            int x_row = ty + rn * THREAD_Y;
+#pragma unroll
+            for (int rm = 0; rm < OUT_M; ++rm) {
+                int y_row = tx + rm * THREAD_X;
                 float acc = 0.0f;
-                if (dlim == TD) {
-                    #pragma unroll
-                    for (int q = 0; q < TD / 4; ++q) {
-                        float4 xv = xs4[q], yv = ys4[q];
-                        float d0f = xv.x - yv.x, d1f = xv.y - yv.y;
-                        float d2f = xv.z - yv.z, d3f = xv.w - yv.w;
-                        acc += d0f*d0f + d1f*d1f + d2f*d2f + d3f*d3f;
-                    }
-                } else {
-                    for (int dd = 0; dd < dlim; ++dd) {
-                        float diff = Xs[xr][dd] - Ys[yr][dd];
-                        acc += diff * diff;
-                    }
+                int k = 0;
+                for (; k + 3 < d_limit; k += 4) {
+                    float dx0 = xs[x_row][k] - ys[y_row][k];
+                    float dx1 = xs[x_row][k + 1] - ys[y_row][k + 1];
+                    float dx2 = xs[x_row][k + 2] - ys[y_row][k + 2];
+                    float dx3 = xs[x_row][k + 3] - ys[y_row][k + 3];
+                    acc += dx0 * dx0 + dx1 * dx1 + dx2 * dx2 + dx3 * dx3;
                 }
-                dist[a][b] += acc;
+                for (; k < d_limit; ++k) {
+                    float diff = xs[x_row][k] - ys[y_row][k];
+                    acc += diff * diff;
+                }
+                dist[rn][rm] += acc;
             }
         }
         __syncthreads();
     }
 
-    #pragma unroll
-    for (int a = 0; a < RN; ++a) {
-        int gr = row0 + ty + a * TY;
-        #pragma unroll
-        for (int b = 0; b < RM; ++b) {
-            int gc = col0 + tx + b * TX;
-            if (gr < N && gc < M)
-                K[(size_t)gr * M + gc] = expf(-gamma * dist[a][b]);
+#pragma unroll
+    for (int rn = 0; rn < OUT_N; ++rn) {
+        int row = row_base + ty + rn * THREAD_Y;
+#pragma unroll
+        for (int rm = 0; rm < OUT_M; ++rm) {
+            int col = col_base + tx + rm * THREAD_X;
+            if (row < n && col < m) {
+                out[static_cast<long long>(row) * m + col] = expf(-gamma * dist[rn][rm]);
+            }
         }
     }
 }
 
-torch::Tensor rbf_forward(torch::Tensor X, torch::Tensor Y, double gamma) {
-    TORCH_CHECK(X.is_cuda() && Y.is_cuda(), "X, Y must be CUDA tensors");
-    TORCH_CHECK(X.dtype() == torch::kFloat32 && Y.dtype() == torch::kFloat32,
-                "X, Y must be float32");
-    TORCH_CHECK(X.dim() == 2 && Y.dim() == 2, "X, Y must be 2D");
-    TORCH_CHECK(X.size(1) == Y.size(1), "X, Y must share feature dim D");
+}  // namespace
 
-    X = X.contiguous();
-    Y = Y.contiguous();
-    int N = X.size(0);
-    int M = Y.size(0);
-    int D = X.size(1);
+torch::Tensor rbf_forward(torch::Tensor x, torch::Tensor y, double gamma) {
+    TORCH_CHECK(x.is_cuda() && y.is_cuda(), "RBF inputs must be CUDA tensors");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat32 && y.scalar_type() == torch::kFloat32,
+                "RBF only supports float32");
+    TORCH_CHECK(x.dim() == 2 && y.dim() == 2, "RBF inputs must be 2D");
+    TORCH_CHECK(x.size(1) == y.size(1), "RBF feature dimensions must match");
+    TORCH_CHECK(x.is_contiguous() && y.is_contiguous(), "RBF inputs must be contiguous");
 
-    auto K = torch::empty({N, M}, X.options());
+    int n = static_cast<int>(x.size(0));
+    int d = static_cast<int>(x.size(1));
+    int m = static_cast<int>(y.size(0));
+    auto out = torch::empty({n, m}, x.options());
 
-    dim3 threads(TX, TY);
-    dim3 blocks((M + BM - 1) / BM, (N + BN - 1) / BN);
-    rbf_forward_kernel<<<blocks, threads>>>(
-        X.data_ptr<float>(), Y.data_ptr<float>(), K.data_ptr<float>(),
-        N, M, D, (float)gamma);
-
-    return K;
-}
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("rbf_forward", &rbf_forward, "RBF kernel matrix forward (CUDA, tiled+coarsened)");
+    dim3 block(THREAD_X, THREAD_Y);
+    dim3 grid((m + TILE_M - 1) / TILE_M, (n + TILE_N - 1) / TILE_N);
+    rbf_forward_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+        x.data_ptr<float>(),
+        y.data_ptr<float>(),
+        out.data_ptr<float>(),
+        n,
+        m,
+        d,
+        static_cast<float>(gamma));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
 }

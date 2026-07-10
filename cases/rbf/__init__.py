@@ -1,10 +1,8 @@
-"""RBF case：暴露 CASE 实例供 framework 使用。"""
-
 import os
 
 from framework.case import Case
 from cases.rbf import config
-from cases.rbf.reference import reference_forward, make_inputs
+from cases.rbf.reference import make_inputs, reference_forward
 
 
 def _load_description():
@@ -18,7 +16,7 @@ CASE = Case(
     description=_load_description(),
     params={"gamma": config.GAMMA},
     grad_inputs=["X", "Y"],
-    dtype=config.DTYPE,
+    dtype="float32",
     make_inputs=make_inputs,
     reference_forward=reference_forward,
 )

@@ -1,88 +1,137 @@
-// RBF 反向 kernel（阶段3优化版 v2：前向缓存 K 复用，消除 dist/exp 重算 + per-j 规约）。
-//
-// 关键优化（loop.md #2 前向缓存复用）：前向已算出 K[i,j]，autograd 保存后传入反向，
-// 则反向无需重算 dist/exp，且每个 j 的贡献系数 coef[i,j]=-2γ·G[i,j]·K[i,j] 是标量，
-// 各分量 d 独立累加，**不再需要 per-j 的 block 内规约**（同步开销归零）。
-//   dX[i,d] = sum_j coef[i,j] * (X[i,d]-Y[j,d])
-//   dY[j,d] = sum_i coef[i,j] * (Y[j,d]-X[i,d]) = -sum_i coef[i,j]*(X[i,d]-Y[j,d])
-//
-// block-per-row，thread-per-d，高 occupancy；保持 fp32。
-
 #include <torch/extension.h>
-#include <cuda.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
 #include <cuda_runtime.h>
 
-// dX：block = 行 i，thread = 分量 d
-__global__ void rbf_backward_dX_kernel(
-        const float* __restrict__ X,   // [N, D]
-        const float* __restrict__ Y,   // [M, D]
-        const float* __restrict__ G,   // [N, M]
-        const float* __restrict__ K,   // [N, M] 前向缓存
-        float* __restrict__ dX,        // [N, D]
-        int N, int M, int D, float gamma) {
-    int i = blockIdx.x;
-    int d = threadIdx.x;
-    if (i >= N || d >= D) return;
+namespace {
 
-    float xid = X[(size_t)i * D + d];
-    const float* grow = G + (size_t)i * M;
-    const float* krow = K + (size_t)i * M;
-    float acc = 0.0f;
-    for (int j = 0; j < M; ++j) {
-        float coef = -2.0f * gamma * grow[j] * krow[j];   // 标量，无需规约
-        acc += coef * (xid - Y[(size_t)j * D + d]);
+constexpr int THREADS = 256;
+
+__global__ void rbf_backward_x_kernel(
+    const float* __restrict__ grad_out,
+    const float* __restrict__ x,
+    const float* __restrict__ y,
+    const float* __restrict__ out,
+    float* __restrict__ grad_x,
+    int n,
+    int m,
+    int d,
+    float scale) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n * d;
+    if (idx >= total) {
+        return;
     }
-    dX[(size_t)i * D + d] = acc;
+
+    int dim = idx % d;
+    int i = idx / d;
+    float x_val = x[static_cast<long long>(i) * d + dim];
+    const float* grad_row = grad_out + static_cast<long long>(i) * m;
+    const float* out_row = out + static_cast<long long>(i) * m;
+    float acc = 0.0f;
+
+    for (int j = 0; j < m; ++j) {
+        float weighted_k = grad_row[j] * out_row[j];
+        float y_val = y[static_cast<long long>(j) * d + dim];
+        acc += weighted_k * (y_val - x_val);
+    }
+    grad_x[idx] = scale * acc;
 }
 
-// dY：block = 行 j，thread = 分量 d
-__global__ void rbf_backward_dY_kernel(
-        const float* __restrict__ X,   // [N, D]
-        const float* __restrict__ Y,   // [M, D]
-        const float* __restrict__ G,   // [N, M]
-        const float* __restrict__ K,   // [N, M]
-        float* __restrict__ dY,        // [M, D]
-        int N, int M, int D, float gamma) {
-    int j = blockIdx.x;
-    int d = threadIdx.x;
-    if (j >= M || d >= D) return;
-
-    float yjd = Y[(size_t)j * D + d];
-    float acc = 0.0f;
-    for (int i = 0; i < N; ++i) {
-        float coef = -2.0f * gamma * G[(size_t)i * M + j] * K[(size_t)i * M + j];
-        acc += coef * (yjd - X[(size_t)i * D + d]);
+__global__ void rbf_backward_y_kernel(
+    const float* __restrict__ grad_out,
+    const float* __restrict__ x,
+    const float* __restrict__ y,
+    const float* __restrict__ out,
+    float* __restrict__ grad_y,
+    int n,
+    int m,
+    int d,
+    float scale) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = m * d;
+    if (idx >= total) {
+        return;
     }
-    dY[(size_t)j * D + d] = acc;
+
+    int dim = idx % d;
+    int j = idx / d;
+    float y_val = y[static_cast<long long>(j) * d + dim];
+    float acc = 0.0f;
+
+    for (int i = 0; i < n; ++i) {
+        long long offset = static_cast<long long>(i) * m + j;
+        float weighted_k = grad_out[offset] * out[offset];
+        float x_val = x[static_cast<long long>(i) * d + dim];
+        acc += weighted_k * (x_val - y_val);
+    }
+    grad_y[idx] = scale * acc;
 }
+
+}  // namespace
+
+torch::Tensor rbf_forward(torch::Tensor x, torch::Tensor y, double gamma);
 
 std::vector<torch::Tensor> rbf_backward(
-        torch::Tensor X, torch::Tensor Y, torch::Tensor G, torch::Tensor K, double gamma) {
-    TORCH_CHECK(X.is_cuda() && Y.is_cuda() && G.is_cuda() && K.is_cuda(), "inputs must be CUDA");
-    TORCH_CHECK(X.dtype() == torch::kFloat32 && Y.dtype() == torch::kFloat32
-                && G.dtype() == torch::kFloat32 && K.dtype() == torch::kFloat32,
-                "inputs must be float32");
-    X = X.contiguous();
-    Y = Y.contiguous();
-    G = G.contiguous();
-    K = K.contiguous();
-    int N = X.size(0);
-    int M = Y.size(0);
-    int D = X.size(1);
+    torch::Tensor grad_out,
+    torch::Tensor x,
+    torch::Tensor y,
+    torch::Tensor out,
+    double gamma) {
+    TORCH_CHECK(grad_out.is_cuda() && x.is_cuda() && y.is_cuda() && out.is_cuda(),
+                "RBF backward tensors must be CUDA tensors");
+    TORCH_CHECK(grad_out.scalar_type() == torch::kFloat32 &&
+                x.scalar_type() == torch::kFloat32 &&
+                y.scalar_type() == torch::kFloat32 &&
+                out.scalar_type() == torch::kFloat32,
+                "RBF backward only supports float32");
+    TORCH_CHECK(grad_out.is_contiguous() && x.is_contiguous() && y.is_contiguous() && out.is_contiguous(),
+                "RBF backward tensors must be contiguous");
 
-    auto dX = torch::empty_like(X);
-    auto dY = torch::empty_like(Y);
+    int n = static_cast<int>(x.size(0));
+    int d = static_cast<int>(x.size(1));
+    int m = static_cast<int>(y.size(0));
+    TORCH_CHECK(y.size(1) == d, "RBF backward feature dimensions must match");
+    TORCH_CHECK(grad_out.size(0) == n && grad_out.size(1) == m, "RBF grad_out shape mismatch");
+    TORCH_CHECK(out.size(0) == n && out.size(1) == m, "RBF saved output shape mismatch");
 
-    rbf_backward_dX_kernel<<<N, D>>>(
-        X.data_ptr<float>(), Y.data_ptr<float>(), G.data_ptr<float>(), K.data_ptr<float>(),
-        dX.data_ptr<float>(), N, M, D, (float)gamma);
-    rbf_backward_dY_kernel<<<M, D>>>(
-        X.data_ptr<float>(), Y.data_ptr<float>(), G.data_ptr<float>(), K.data_ptr<float>(),
-        dY.data_ptr<float>(), N, M, D, (float)gamma);
+    auto grad_x = torch::empty_like(x);
+    auto grad_y = torch::empty_like(y);
+    float scale = 2.0f * static_cast<float>(gamma);
 
-    return {dX, dY};
+    int gx_total = n * d;
+    int gy_total = m * d;
+    int gx_blocks = (gx_total + THREADS - 1) / THREADS;
+    int gy_blocks = (gy_total + THREADS - 1) / THREADS;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    rbf_backward_x_kernel<<<gx_blocks, THREADS, 0, stream>>>(
+        grad_out.data_ptr<float>(),
+        x.data_ptr<float>(),
+        y.data_ptr<float>(),
+        out.data_ptr<float>(),
+        grad_x.data_ptr<float>(),
+        n,
+        m,
+        d,
+        scale);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    rbf_backward_y_kernel<<<gy_blocks, THREADS, 0, stream>>>(
+        grad_out.data_ptr<float>(),
+        x.data_ptr<float>(),
+        y.data_ptr<float>(),
+        out.data_ptr<float>(),
+        grad_y.data_ptr<float>(),
+        n,
+        m,
+        d,
+        scale);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return {grad_x, grad_y};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("rbf_backward", &rbf_backward, "RBF kernel matrix backward (CUDA, cached-K)");
+    m.def("rbf_forward", &rbf_forward, "RBF forward (CUDA)");
+    m.def("rbf_backward", &rbf_backward, "RBF backward (CUDA)");
 }

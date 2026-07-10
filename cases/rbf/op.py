@@ -1,49 +1,51 @@
-"""RBF kernel 的候选实现封装（dict 接口，符合 framework 的候选契约）。
-
-candidate(inputs, params) -> K，对 inputs["X"]/inputs["Y"] 提供梯度。
-kernel 源在 cases/rbf/kernels/，由 framework.loader 即时编译。float32-only。
-"""
-
-import os
 import functools
+import os
 
 import torch
 
 from framework.loader import load_kernel
 
-_KDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels")
+
+_KERNEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels")
 
 
 @functools.lru_cache(maxsize=1)
-def _fwd_module():
-    return load_kernel("rbf_forward", ["rbf_forward.cu"], base_dir=_KDIR)
+def _extension():
+    return load_kernel(
+        "rbf_ext",
+        ["rbf_forward.cu", "rbf_backward.cu"],
+        base_dir=_KERNEL_DIR,
+        verbose=False,
+    )
 
 
-@functools.lru_cache(maxsize=1)
-def _bwd_module():
-    return load_kernel("rbf_backward", ["rbf_backward.cu"], base_dir=_KDIR)
-
-
-class RBFFunction(torch.autograd.Function):
+class _RBFFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, X, Y, gamma):
-        K = _fwd_module().rbf_forward(X, Y, float(gamma))
-        ctx.save_for_backward(X, Y, K)   # 缓存 K 供反向复用，免重算 dist/exp
-        ctx.gamma = float(gamma)
-        return K
+    def forward(ctx, x, y, gamma):
+        x = x.contiguous()
+        y = y.contiguous()
+        gamma = float(gamma)
+        out = _extension().rbf_forward(x, y, gamma)
+        ctx.save_for_backward(x, y, out)
+        ctx.gamma = gamma
+        return out
 
     @staticmethod
-    def backward(ctx, G):
-        X, Y, K = ctx.saved_tensors
-        dX, dY = _bwd_module().rbf_backward(X, Y, G.contiguous(), K, ctx.gamma)
-        return dX, dY, None
+    def backward(ctx, grad_out):
+        x, y, out = ctx.saved_tensors
+        grad_x, grad_y = _extension().rbf_backward(
+            grad_out.contiguous(), x, y, out, ctx.gamma
+        )
+        return grad_x, grad_y, None
 
 
 def candidate(inputs, params):
-    """framework 候选契约：inputs={"X","Y"}, params={"gamma"} -> K。"""
-    return RBFFunction.apply(inputs["X"], inputs["Y"], params["gamma"])
+    return _RBFFunction.apply(inputs["X"], inputs["Y"], float(params["gamma"]))
 
 
 def forward_only(inputs, params):
-    """仅前向（no autograd），供前向单独对拍/调试。"""
-    return _fwd_module().rbf_forward(inputs["X"], inputs["Y"], float(params["gamma"]))
+    return _extension().rbf_forward(
+        inputs["X"].contiguous(),
+        inputs["Y"].contiguous(),
+        float(params["gamma"]),
+    )
