@@ -109,7 +109,7 @@ python skill/scripts/verify_case.py --case <name>
 
 ### 步骤 4：写 CUDA 反向 kernel → 验证
 在 `kernels/` 写反向 `.cu`（计算各 `grad_inputs` 的梯度），`op.py` 用 `torch.autograd.Function` 把前反向包成 `candidate(inputs, params)`。再跑 `verify_case.py`，确认反向各梯度也全 PASS。
-- 反向数学：先手推 `dL/d(中间量)`，再链式到各输入梯度（RBF 的推导见 `cases/rbf/description.md`）。
+- **反向数学自主获取**（不依赖 description 给公式）：PyTorch 参考的反向本就由 autograd 自动提供，所以**金标准梯度是现成的**——你只需让 CUDA 反向 kernel 的数值**复现 autograd 的梯度**，用 `verify_case.py` 对拍校验即可。若需手推，用链式法则通用套路（先 `dL/d(中间量)`，再链到各输入），见下方"CUDA Kernel 实现技巧"。
 
 ### 步骤 5：计时对比 torch.compile
 ```
@@ -122,6 +122,43 @@ python skill/scripts/bench_case.py --case <name>
 
 ### 步骤 7：交付
 产出可独立编译的 `.cu`（含必要 host 绑定），确认无对 torch 高层算子的运行时依赖。
+
+## CUDA Kernel 实现技巧（提前学习——用户只给朴素算法描述，这些知识靠你自己掌握）
+
+用户的 description 通常只有自然语言 + 前向公式 + shape，**不会给反向公式、数值稳定或优化提示**。
+以下是实现任意算法 kernel 都通用的技巧，据此自主完成，不要指望用户在输入里喂。
+
+### A. 反向梯度：不用等用户给公式
+- **autograd 即金标准**：写对 PyTorch 前向后，`verify_case.py` 会用 autograd 自动算出参考梯度。你的 CUDA 反向 kernel 只要**数值上复现它**即可——对拍着调，误差进 atol 就对了。
+- **手推套路**（需要时）：设中间量（如 dist、softmax、mean/std），先求 `dL/d(中间量)=上游梯度·d(输出)/d(中间量)`，再链式到各输入。逐元素运算梯度就地乘；规约（sum/mean/max）的反向是"广播回去"；矩阵乘 `C=A@B` 的反向是 `dA=dC@Bᵀ, dB=Aᵀ@dC`。
+- 只对 `grad_inputs` 里的输入返回梯度，其余（如整型 labels）在 autograd.Function.backward 里返回 `None`。
+
+### B. 数值稳定（自己就要想到）
+- **softmax/logsumexp**：先减去该行 max 再 exp（`exp(x-max)`），避免上溢；`logsumexp = max + log(Σexp(x-max))`。
+- **除法/归一化**：分母加 `eps`（如 `1/sqrt(var+eps)`）。
+- 避免大数相消；累加用 float 累加器（即便输出 fp32，规约中间量也别过早截断）。
+
+### C. 规约模式（mean/var/sum/max/softmax 都用得上）
+- **block-per-row**：一个 block 处理一行/一个样本，block 内多线程 grid-stride 遍历该行，再树形规约（`shared[t]+=shared[t+s]`，`s` 折半，配 `__syncthreads()`）。
+- **warp 规约**：一个 warp 内用 `__shfl_down_sync` 免 shared 往返，更快。
+- **两遍规约**：如 var 需先得 mean 再求平方差和；logsumexp 需先 max 再 sum。行内规约做两趟即可。
+
+### D. 访存优化
+- **float4 向量化**：连续维度按 `float4`（或 `reinterpret_cast<const float4*>`）一次读 4 个，减少 load 指令、提升带宽利用。要求 16B 对齐、维度是 4 的倍数。
+- **合并访问**：同一 warp 的线程访问连续地址；行主序下让 `threadIdx.x` 对应最内维。
+- 指针加 `__restrict__` 帮编译器优化。
+
+### E. occupancy 与并行度
+- **别用过大 block**：如 1024 线程/block 常使每 SM 只驻留 1 个 block、占用率仅 ~50%。256 线程/block 通常更优（可多 block 并存）。
+- **thread coarsening**：每线程算多个输出（如 2×2 微块），减少总 block 数、复用寄存器里的数据。
+- 并行度不足（如"一线程算一整行"只有 N 个线程）是常见慢因——让线程数足够喂满所有 SM。
+
+### F. 避免重算 / 融合
+- **前向缓存复用**：反向要用的前向中间量（K、softmax、mean/std 等），在 `autograd.Function.forward` 里 `ctx.save_for_backward` 存下，反向直接读，别重算。这常是反向提速的决定性一招。
+- **算子融合**：把多步逐元素/规约（如 距离→exp、norm→仿射）融进一个 kernel，避免中间张量物化和额外 kernel launch。
+- **避免物化大中间量**：若朴素参考会物化 [N,M,D] 之类的大张量（广播式），手写融合 kernel 全程不物化即是内存带宽优势来源。
+
+> 优化时不必一次全上——先写朴素正确版过 verify，再按 [loop.md] 按收益逐项加（先提 occupancy，再缓存复用/融合，再 float4/warp）。每次改完先 verify 再 bench。
 
 ## 防作弊红线（不可违反）
 
