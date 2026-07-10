@@ -117,7 +117,7 @@ CUDA_VISIBLE_DEVICES=<空闲卡> CUDA_ARCHS=80 python skill/scripts/bench_case.p
 |--------------|-------|-------|-------|
 | RBF          | ✅（精简版重生 PASS，前~2e-7/反~6e-7，用了缓存K复用） | ✅⚡（精简版重生，前1.09×/反1.40×，tiling+coarsening+缓存K，CV<1%） | ⬜ |
 | LayerNorm    | ✅（5.3 已验证 PASS，自主推导dX耦合项） | ✅⚠️（精简版重生，正确性全PASS+自主推导dX耦合项+二维分块列规约；反1.24×达标，前向@默认B=4096虚高1.2×、放大B=32768摊薄固定开销后0.97×未达标——前向优化留阶段6自主闭环） | ⬜ |
-| Softmax-CE   | ⬜（待 aider 生成） | ✅⚡（精简版重生，前1.62×/反2.79×，logsumexp减max+template复用+缓存probs；早期非精简版曾1.97/1.80） | ⬜ |
+| Softmax-CE   | ✅⚡（精简版重生，前1.23×/反2.55×，logsumexp减max+单文件.cu+缓存probs，前向前4种子误差0） | ✅⚡（精简版重生，前1.62×/反2.79×，logsumexp减max+template复用+缓存probs；早期非精简版曾1.97/1.80） | ⬜ |
 
 > 注：codex/gptme 此前的 Softmax-CE 达标是在 description 精简**之前**测的；本轮矩阵用精简版重测以对齐。
 > 分支命名：`test/kt-<case>-<agent>`（如 `test/kt-rbf-aider`）。
