@@ -1,69 +1,139 @@
-// Softmax 交叉熵 —— 前向 kernel（block-per-row，数值稳定 logsumexp）。
-//   logits:[B,C], labels:[B] -> 标量 loss = mean_b( logsumexp(logits[b,:]) - logits[b,labels[b]] )
-//
-// 一个 block 处理一行 b：blockDim 个线程 grid-stride 遍历 C 个类别，
-// block 内规约求 max（数值稳定）与 sum(exp(logit-max))，得 logsumexp；
-// loss_b = logsumexp - logits[b, labels[b]]；atomicAdd 累加到全局 loss（host 端 /B）。
-
 #include <torch/extension.h>
-#include <cuda.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
 #include <cuda_runtime.h>
 
-#define THREADS 256
+#include <cstdint>
+#include <cfloat>
 
-__global__ void softmax_ce_forward_kernel(
-        const float* __restrict__ logits,   // [B, C]
-        const long*  __restrict__ labels,   // [B]
-        float* __restrict__ loss_accum,     // [1] 全局累加器
-        int B, int C) {
-    int b = blockIdx.x;
-    if (b >= B) return;
-    const float* row = logits + (size_t)b * C;
+namespace {
 
-    __shared__ float sred[THREADS];
-    int t = threadIdx.x;
+constexpr int THREADS = 256;
 
-    // --- 求行 max ---
-    float lmax = -3.4e38f;
-    for (int c = t; c < C; c += blockDim.x) lmax = fmaxf(lmax, row[c]);
-    sred[t] = lmax; __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (t < s) sred[t] = fmaxf(sred[t], sred[t + s]);
-        __syncthreads();
+template <bool STORE_PROBS>
+__global__ void softmax_ce_forward_rows_kernel(
+    const float* __restrict__ logits,
+    const int64_t* __restrict__ labels,
+    float* __restrict__ probs,
+    float* __restrict__ loss,
+    int bsz,
+    int classes) {
+    __shared__ float shared[THREADS];
+
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= bsz) {
+        return;
     }
-    float rowmax = sred[0];
+
+    const float* row_logits = logits + static_cast<long long>(row) * classes;
+    float local_max = -FLT_MAX;
+    for (int c = tid; c < classes; c += blockDim.x) {
+        float v = row_logits[c];
+        local_max = fmaxf(local_max, v);
+    }
+
+    shared[tid] = local_max;
     __syncthreads();
-
-    // --- 求 sum(exp(x-max)) ---
-    float lsum = 0.0f;
-    for (int c = t; c < C; c += blockDim.x) lsum += expf(row[c] - rowmax);
-    sred[t] = lsum; __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (t < s) sred[t] += sred[t + s];
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared[tid] = fmaxf(shared[tid], shared[tid + stride]);
+        }
         __syncthreads();
     }
-    if (t == 0) {
-        float logsumexp = rowmax + logf(sred[0]);
-        float loss_b = logsumexp - row[labels[b]];
-        atomicAdd(loss_accum, loss_b);
+    float row_max = shared[0];
+
+    float local_sum = 0.0f;
+    float* row_probs = probs;
+    if (STORE_PROBS) {
+        row_probs = probs + static_cast<long long>(row) * classes;
+    }
+    for (int c = tid; c < classes; c += blockDim.x) {
+        float e = expf(row_logits[c] - row_max);
+        local_sum += e;
+        if (STORE_PROBS) {
+            row_probs[c] = e;
+        }
+    }
+
+    shared[tid] = local_sum;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        __syncthreads();
+    }
+    float row_sum = shared[0];
+
+    if (STORE_PROBS) {
+        float inv_sum = 1.0f / row_sum;
+        for (int c = tid; c < classes; c += blockDim.x) {
+            row_probs[c] *= inv_sum;
+        }
+    }
+
+    if (tid == 0) {
+        int64_t label = labels[row];
+        float row_loss = row_max + logf(row_sum) - row_logits[label];
+        atomicAdd(loss, row_loss / static_cast<float>(bsz));
     }
 }
 
-torch::Tensor softmax_ce_forward(torch::Tensor logits, torch::Tensor labels) {
-    TORCH_CHECK(logits.is_cuda() && labels.is_cuda(), "inputs must be CUDA");
-    TORCH_CHECK(logits.dtype() == torch::kFloat32, "logits must be float32");
-    TORCH_CHECK(labels.dtype() == torch::kLong, "labels must be int64");
-    logits = logits.contiguous();
-    labels = labels.contiguous();
-    int B = logits.size(0), C = logits.size(1);
-
-    auto loss = torch::zeros({}, logits.options());
-    softmax_ce_forward_kernel<<<B, THREADS>>>(
-        logits.data_ptr<float>(), labels.data_ptr<long>(),
-        loss.data_ptr<float>(), B, C);
-    return loss / B;   // 对 batch 取平均
+void check_softmax_ce_inputs(torch::Tensor logits, torch::Tensor labels) {
+    TORCH_CHECK(logits.is_cuda() && labels.is_cuda(),
+                "softmax_ce inputs must be CUDA tensors");
+    TORCH_CHECK(logits.scalar_type() == torch::kFloat32,
+                "softmax_ce logits must be float32");
+    TORCH_CHECK(labels.scalar_type() == torch::kInt64,
+                "softmax_ce labels must be int64");
+    TORCH_CHECK(logits.dim() == 2, "softmax_ce logits must be 2D");
+    TORCH_CHECK(labels.dim() == 1, "softmax_ce labels must be 1D");
+    TORCH_CHECK(logits.size(0) == labels.size(0),
+                "softmax_ce batch size mismatch");
+    TORCH_CHECK(logits.is_contiguous() && labels.is_contiguous(),
+                "softmax_ce inputs must be contiguous");
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("softmax_ce_forward", &softmax_ce_forward, "Softmax CE forward (CUDA)");
+}  // namespace
+
+torch::Tensor softmax_ce_forward_only(torch::Tensor logits, torch::Tensor labels) {
+    check_softmax_ce_inputs(logits, labels);
+
+    int bsz = static_cast<int>(logits.size(0));
+    int classes = static_cast<int>(logits.size(1));
+    auto loss = torch::zeros({}, logits.options());
+
+    softmax_ce_forward_rows_kernel<false>
+        <<<bsz, THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+            logits.data_ptr<float>(),
+            labels.data_ptr<int64_t>(),
+            nullptr,
+            loss.data_ptr<float>(),
+            bsz,
+            classes);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return loss;
+}
+
+std::vector<torch::Tensor> softmax_ce_forward(
+    torch::Tensor logits,
+    torch::Tensor labels) {
+    check_softmax_ce_inputs(logits, labels);
+
+    int bsz = static_cast<int>(logits.size(0));
+    int classes = static_cast<int>(logits.size(1));
+    auto loss = torch::zeros({}, logits.options());
+    auto probs = torch::empty_like(logits);
+
+    softmax_ce_forward_rows_kernel<true>
+        <<<bsz, THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+            logits.data_ptr<float>(),
+            labels.data_ptr<int64_t>(),
+            probs.data_ptr<float>(),
+            loss.data_ptr<float>(),
+            bsz,
+            classes);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {loss, probs};
 }

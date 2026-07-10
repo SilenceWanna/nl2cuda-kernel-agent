@@ -1,10 +1,7 @@
-"""Softmax 交叉熵 case：暴露 CASE 实例。"""
-
 import os
 
 from framework.case import Case
-from cases.softmax_ce import config
-from cases.softmax_ce.reference import reference_forward, make_inputs
+from cases.softmax_ce.reference import make_inputs, reference_forward
 
 
 def _load_description():
@@ -16,9 +13,9 @@ def _load_description():
 CASE = Case(
     name="softmax_ce",
     description=_load_description(),
-    params={},                       # 无标量参数
-    grad_inputs=["logits"],          # 只对 logits 求梯度；labels 是整型索引
-    dtype=config.DTYPE,
+    params={},
+    grad_inputs=["logits"],
+    dtype="float32",
     make_inputs=make_inputs,
     reference_forward=reference_forward,
 )
