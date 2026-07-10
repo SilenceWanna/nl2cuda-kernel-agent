@@ -124,7 +124,23 @@ CUDA_VISIBLE_DEVICES=<空闲卡> CUDA_ARCHS=80 python skill/scripts/bench_case.p
 |--------------|-------|-------|-------|
 | RBF          | ✅（精简版重生 PASS，前~2e-7/反~6e-7，用了缓存K复用） | ✅⚡（精简版重生，前1.09×/反1.40×，tiling+coarsening+缓存K，CV<1%） | ✅正确/⚠️性能（真净房重生，与旧版diff251行原创，verify全PASS；前1.04×差临门、反0.016×慢63倍——反向shared-mem atomicAdd竞争缺陷，性能留阶段6自主优化） |
 | LayerNorm    | ✅（5.3 已验证 PASS，自主推导dX耦合项） | ✅⚠️（精简版重生，正确性全PASS+自主推导dX耦合项+二维分块列规约；反1.24×达标，前向@默认B=4096虚高1.2×、放大B=32768摊薄固定开销后0.97×未达标——前向优化留阶段6自主闭环） | ⚠️FAIL（真净房重生，与旧版diff197行原创，结构对+自主推导dX耦合项+二维分块列规约，但block_reduce_sum结果未广播回全线程→前向mean算错→verify FAIL(前err~3500)。真实bug留阶段6自主纠错） |
-| Softmax-CE   | ✅⚡（精简版重生，前1.23×/反2.55×，logsumexp减max+单文件.cu+缓存probs，前向前4种子误差0） | ✅⚡（精简版重生，前1.62×/反2.79×，logsumexp减max+template复用+缓存probs；早期非精简版曾1.97/1.80） | ⬜ |
+| Softmax-CE   | ✅⚡（精简版重生，前1.23×/反2.55×，logsumexp减max+单文件.cu+缓存probs，前向前4种子误差0） | ✅⚡（精简版重生，前1.62×/反2.79×，logsumexp减max+template复用+缓存probs；早期非精简版曾1.97/1.80） | ✅⚡（真净房重生，前1.75×/反3.91×，logsumexp减max+block_reduce广播已修+缓存logsumexp反向重算softmax；反向为三agent最快） |
 
 > 注：codex/gptme 此前的 Softmax-CE 达标是在 description 精简**之前**测的；本轮矩阵用精简版重测以对齐。
 > 分支命名：`test/kt-<case>-<agent>`（如 `test/kt-rbf-aider`）。
+
+## 6. 3×3 矩阵结论（精简 description 重生）
+
+**9/9 全部生成，正确性 7/9 PASS，性能达标 6/9。** 三 agent 均能仅凭精简 description + SKILL.md 技巧库
+**自主推导反向**（RBF 的 dX/dY、LayerNorm 最难的 dX 耦合项、Softmax-CE 的 dlogits），且守防作弊红线
+（fp32/无 fast-math/无 F.*/framework 未改）。**知识转移成立**——反向公式已从"用户输入"移到"skill 方法论"。
+
+agent 间差异**只在实现成熟度**（skill 无关）：
+- **codex**：3/3 正确，2 达标（RBF 前1.09/反1.40、Softmax-CE 前1.62/反2.79）；LayerNorm 前向短核陷阱下 0.97×。最稳。
+- **aider**：3/3 正确 + 达标（RBF、LayerNorm-5.3、Softmax-CE 前1.23/反2.55）。
+- **gptme**（GPT-5.5）：Softmax-CE 达标且反向 3.91× 为三家最快；RBF 正确但反向 atomicAdd 竞争慢 63×；
+  LayerNorm 有 block_reduce 广播 bug 致 verify FAIL（同会话 Softmax-CE 却修对了广播——是疏忽非能力）。
+
+**共性洞察**：agent 能写出**结构/数学正确**的 kernel，但**性能优化到位度**和**实现细节 bug**（block_reduce 广播、
+atomicAdd 竞争）参差——这些正是**阶段 6 优化闭环**（读 verify/bench 反馈→自主迭代）要解决的。
+gptme 的 3 个 case 恰好覆盖了"正确达标 / 正确但慢 / 有 bug"三种典型，是阶段 6 自主纠错/优化的理想试验样本。
