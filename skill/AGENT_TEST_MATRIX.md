@@ -102,8 +102,8 @@ CUDA_VISIBLE_DEVICES=<空闲卡> CUDA_ARCHS=80 python skill/scripts/bench_case.p
 
 | case \ agent | aider | codex | gptme |
 |--------------|-------|-------|-------|
-| RBF          | 🔄 生成完，验证中 | ⬜ | ⬜ |
-| LayerNorm    | ✅（5.3 已验证 PASS） | ⬜ | ⬜ |
+| RBF          | ✅（精简版重生 PASS，前~2e-7/反~6e-7，用了缓存K复用） | ⬜ | ⬜ |
+| LayerNorm    | ✅（5.3 已验证 PASS，自主推导dX耦合项） | ⬜ | ⬜ |
 | Softmax-CE   | ⬜（待 aider 生成） | ✅⚡（前1.97/反1.80，早期非精简版） | ⬜ |
 
 > 注：codex/gptme 此前的 Softmax-CE 达标是在 description 精简**之前**测的；本轮矩阵用精简版重测以对齐。
