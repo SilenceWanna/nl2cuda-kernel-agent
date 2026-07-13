@@ -38,6 +38,7 @@ CASE=""
 GPU="7"
 AUTO_GPU=0
 SYNC_CLI=0
+ROUND_CAP=0                                  # 0=禁用(Stage B 半自动默认)；>0 启用机械轮次上限(Stage C 全自主兜底)
 REMOTE_REPO="~/nl2cuda-kernel-agent"
 SIZE_ENV=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -51,6 +52,7 @@ while [ $# -gt 0 ]; do
     --workdir)     WORKDIR="$2"; shift 2 ;;
     --remote-repo) REMOTE_REPO="$2"; shift 2 ;;
     --size-env)    SIZE_ENV="$2"; shift 2 ;;
+    --round-cap)   ROUND_CAP="$2"; shift 2 ;;
     -*)            echo "未知参数: $1" >&2; exit 2 ;;
     *)             CASE="$1"; shift ;;
   esac
@@ -80,6 +82,21 @@ if git -C "$WORKDIR" rev-parse --git-dir >/dev/null 2>&1; then
     echo "$FW_DIFF" >&2
     emit FRAMEWORK_DIRTY; exit 1
   fi
+fi
+
+# ---- (A2) 机械轮次上限兜底（Stage C 全自主防跑飞）----
+# --round-cap N (N>0) 启用：每次调用对本 case 计数；超过 N 轮直接拒跑并发 ROUND_CAP_EXCEEDED，
+# 即便 agent 失控也能在上下文里拿到硬停信号。计数存 workdir 的 .a100_round_<case>，PASS 时清零（见末尾）。
+ROUND_FILE="$WORKDIR/.a100_round_$CASE"
+if [ "$ROUND_CAP" -gt 0 ] 2>/dev/null; then
+  ROUND_N=0; [ -f "$ROUND_FILE" ] && ROUND_N="$(cat "$ROUND_FILE" 2>/dev/null || echo 0)"
+  ROUND_N=$((ROUND_N + 1))
+  echo "$ROUND_N" > "$ROUND_FILE"
+  if [ "$ROUND_N" -gt "$ROUND_CAP" ]; then
+    echo "已达轮次上限 $ROUND_CAP（本轮第 $ROUND_N 次）——停止自主 loop，请人工介入。" >&2
+    emit ROUND_CAP_EXCEEDED; exit 1
+  fi
+  echo "[run_on_a100] round $ROUND_N/$ROUND_CAP" >&2
 fi
 
 # ---- (B) 打包 payload（只含 cases/<case>；--sync-cli 时附带两个 CLI）----
@@ -143,5 +160,10 @@ if [ -z "$RESULT" ] || ! echo "$RESULT" | grep -q '^VERDICT='; then
   emit SSH_ERROR; exit 1
 fi
 echo "$RESULT"
-echo "$RESULT" | grep '^VERDICT=' | tail -1
+FINAL_VERDICT="$(echo "$RESULT" | grep '^VERDICT=' | tail -1)"
+echo "$FINAL_VERDICT"
+# PASS 即 loop 完成，清零轮次计数（下次同 case 重新计）
+if [ "$ROUND_CAP" -gt 0 ] 2>/dev/null && echo "$FINAL_VERDICT" | grep -q '^VERDICT=PASS'; then
+  rm -f "$ROUND_FILE" 2>/dev/null || true
+fi
 exit 0

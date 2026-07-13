@@ -54,7 +54,25 @@ agent 自己调 `run_on_a100.sh` 在远程 A100 上跑 verify/bench，读机读 
 - ⏹ **轮次上限 8–12 轮**仍未达标 → 停下，报告当前最好结果 + 瓶颈分析，请人工介入。
 - ⏹ **连续 2–3 轮无有效提升**（排除 CV 噪声后）→ 停下报告。
 
-> 半自动阶段：人工盯每轮，可随时喊停。全自动阶段：脚本会在超上限时发 `VERDICT=ROUND_CAP_EXCEEDED` 兜底。
+> 半自动阶段（Stage B）：人工盯每轮，可随时喊停。
+> 全自主阶段（Stage C）：给 `run_on_a100.sh` 传 `--round-cap N`（如 12）启用**机械轮次兜底**——脚本按 case
+> 计数（存 workdir 的 `.a100_round_<case>`，已 gitignore），超过 N 轮直接拒跑并发 `VERDICT=ROUND_CAP_EXCEEDED`，
+> 即便 agent 失控也能在上下文拿到硬停信号；`VERDICT=PASS` 时自动清零计数。默认 `--round-cap 0`（禁用，即 Stage B 行为）。
+
+## Stage C 全自主启动（去人工中转）
+
+前提同上（能双跳 SSH + 有脚本 + 首轮 --sync-cli）。与 Stage B 的唯一区别：kickoff 提示里让 agent
+**每轮命令都带 `--round-cap 12`**，并说明 `ROUND_CAP_EXCEEDED` = 硬停。agent 自主循环到 PASS 或触顶，无需人工每轮确认。
+
+```
+你将全自主优化 cases/<case>/ 到达标，无人工介入。严格遵守 skill/AUTONOMOUS_LOOP.md 与 loop.md。
+每轮：跑 `bash skill/scripts/run_on_a100.sh <case> --gpu 7 --round-cap 12`（第一轮加 --sync-cli），读末行 VERDICT：
+PASS→停并交付；VERIFY_FAIL→读日志修正确性(不看bench)；BENCH_FAIL→按loop.md优化未达标侧kernel；
+CV_INVALID→原样重跑；ROUND_CAP_EXCEEDED→已达上限，立即停止并报告当前最好结果+瓶颈,不要再跑。
+只改 cases/<case>/kernels/*.cu 及 op.py，绝不动 framework/、不降精度、不改评测脚本。现在开始。
+```
+
+> 建议 Stage C 首个 case 仍在旁观察（不干预、只看它是否自主收敛/正确触顶），确认全自主行为无误后再放手批量。
 
 ## 纪律（防作弊红线，不可违反）
 

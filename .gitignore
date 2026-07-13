@@ -43,3 +43,6 @@ tmp/
 
 # Claude Code 本地会话设置
 .claude/
+
+# 阶段6 自主loop 本地轮次计数(不入库)
+.a100_round_*
