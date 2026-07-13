@@ -170,3 +170,10 @@ PASS 自动清零）。**gptme 全自主跑通**：起点把 RBF 反向重置回
 gptme **自己循环**调 `run_on_a100.sh rbf --round-cap 12`、读 VERDICT、迭代反向 kernel，全程无人工每轮干预，
 自主收敛到 `VERDICT=PASS fwd=3.44×/bwd=1.57×`（换 D=64 专用无 atomic 行/列归约，比 Stage B 半自动的 1.26× 更优；
 round-cap 未触顶、PASS 后计数清零，均已独立复验）。**证明 agent 全自主（自调脚本+自判 VERDICT+自迭代）闭环成立。**
+
+**codex 全自主（第二例，暴露擦线不稳问题）**：起点把 LayerNorm 前向重置回未优化版（`BENCH_FAIL fwd=0.97×`），
+codex 自主循环优化前向（warp shuffle + shared 两级规约），达 `VERDICT=PASS fwd=1.054×`——但**擦线不稳**：独立复跑
+1.059×PASS / 1.040×FAIL 抖动，加速比骑在 1.05 线上。**自主闭环机制成功**（自调脚本/自判/自迭代/守红线全做到），
+但 LayerNorm 前向是 reduce 密集型短核、优化空间小，擦线达标不可靠。→ 由此**强化 skill：擦线（1.05–1.10×）
+须连跑 3 次全 PASS 才算达标、目标留余量 ≥1.10×**（写入 SKILL.md 达标判据 + loop.md 纪律 + AUTONOMOUS_LOOP.md
+终止条件）。对比 gptme(反向 0.016→1.57×，大幅超线稳过) vs codex(前向擦 1.05×)，恰好展示不同 case 的优化空间差异。
