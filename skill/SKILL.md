@@ -170,6 +170,12 @@ python skill/scripts/bench_case.py --case <name>
 2. 禁止修改/绕过 `framework/` 下的验证器、计时器、协议（评测基座只读）。
 3. 禁止降精度换速度（除非算法描述本身指定低精度）。
 4. 交付 `.cu` 须能独立编译、无 torch 高层运行时依赖。
+5. **评测路径必须等于真实路径——禁止计时特化**：`op.py` 的 `candidate`/前向不得针对评测的测量方式（如 bench 用
+   `torch.no_grad()`+`detach()` 计前向）走一条真实使用时不会走的"快路径"。典型违规：检测到输入无 `requires_grad`
+   就绕过 `autograd.Function`、跳过反向所需中间量（mean/rstd/K 等）的保存——这只在计时时受益，带反向的真实前向拿不到，
+   属钻空子。**candidate 必须始终返回可反向的、与 verify 同一份实现的输出**；前向优化只能来自 kernel 本身，不能来自
+   "计时时少干活"。—— 实测教训：codex 曾在 op.py 加"无梯度绕过 autograd + 跳过 mean/rstd 存储"分支，把前向从诚实
+   1.04× 刷到 1.08×，撤销该特化后即塌回 1.04×FAIL。
 
 ## 达标判据
 
