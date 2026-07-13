@@ -38,6 +38,7 @@ CASE=""
 GPU="7"
 AUTO_GPU=0
 SYNC_CLI=0
+STRICT=0                                      # 1=按 VERDICT 决定退出码(PASS=0/其余=1)，供 aider --auto-test 等靠退出码驱动的自主闭环
 ROUND_CAP=0                                  # 0=禁用(Stage B 半自动默认)；>0 启用机械轮次上限(Stage C 全自主兜底)
 REMOTE_REPO="~/nl2cuda-kernel-agent"
 SIZE_ENV=""
@@ -49,6 +50,7 @@ while [ $# -gt 0 ]; do
     --gpu)         GPU="$2"; shift 2 ;;
     --auto-gpu)    AUTO_GPU=1; shift ;;
     --sync-cli)    SYNC_CLI=1; shift ;;
+    --strict)      STRICT=1; shift ;;
     --workdir)     WORKDIR="$2"; shift 2 ;;
     --remote-repo) REMOTE_REPO="$2"; shift 2 ;;
     --size-env)    SIZE_ENV="$2"; shift 2 ;;
@@ -165,5 +167,10 @@ echo "$FINAL_VERDICT"
 # PASS 即 loop 完成，清零轮次计数（下次同 case 重新计）
 if [ "$ROUND_CAP" -gt 0 ] 2>/dev/null && echo "$FINAL_VERDICT" | grep -q '^VERDICT=PASS'; then
   rm -f "$ROUND_FILE" 2>/dev/null || true
+fi
+# --strict：按 VERDICT 返回退出码（PASS=0，其余=1），供 aider --auto-test 等靠退出码驱动的自主闭环；
+# 默认(非strict) 恒 exit 0（Stage B 人工读 VERDICT 决策，不希望非零退出打断脚本）。
+if [ "$STRICT" = "1" ]; then
+  echo "$FINAL_VERDICT" | grep -q '^VERDICT=PASS' && exit 0 || exit 1
 fi
 exit 0

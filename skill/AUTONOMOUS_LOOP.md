@@ -132,3 +132,25 @@ CV_INVALID 则原样重跑。8-12 轮内冲到 VERDICT=PASS。现在开始第一
 ```
 
 > 注意：本节为**方案设计**（用户要求先设计、暂不用当前 dongcc 配置测试）。实跑前需先把 codex 的 `model_provider` 切回 `"OpenAI"`（用户自配代理），再按上述启动。
+
+## aider 全自主（用原生 `--auto-test`，非 /run）
+
+早先以为 aider 无 `/run` 故只能半自动中转——**其实 aider 有原生 `--test-cmd` + `--auto-test`**，是比 /run 更顺的自主闭环：
+aider 每次改完代码**自动跑 test-cmd，退出码≠0 就把输出喂回自己继续修**，循环到退出码=0。把 test-cmd 设成
+`run_on_a100.sh --strict`（`--strict` 使 VERDICT≠PASS 时 exit 1）即可让 aider 靠退出码自主收敛。
+
+**启动（Windows Git Bash）**：
+```bash
+cd <aider workdir>
+aider --model openai/GPT-5.5-joybuilder --model-settings-file .aider.model.settings.yml --yes-always --no-show-model-warnings \
+  --auto-test \
+  --test-cmd "bash skill/scripts/run_on_a100.sh <case> --gpu 7 --strict --round-cap 12"
+```
+- `--strict`：PASS→exit 0（aider 停）；BENCH_FAIL/VERIFY_FAIL/…→exit 1（aider 读输出继续修）。
+- `--round-cap 12`：机械兜底，超轮发 `ROUND_CAP_EXCEEDED` 且 exit 1（aider 会继续，但脚本拒跑——需人工留意；纯全自主时可配合 kickoff 提示"见 ROUND_CAP_EXCEEDED 即停手报告"）。
+- 首轮 test-cmd 可临时加 `--sync-cli`（同步带 --emit-verdict 的 bench 到 A100），之后去掉。
+
+**kickoff 提示**：告诉 aider"我已配 --auto-test，每次改完会自动跑远程 verify+bench；据其输出（VERDICT/日志）
+按 loop.md 迭代，只改 cases/<case>/、守防作弊红线（尤其红线§5：op.py 禁计时特化），直到测试退出码为 0（VERDICT=PASS）"。
+
+> 这样三个 agent 都有真·全自主路径：gptme(WSL内置shell)、codex(内置shell/apply_patch)、aider(--auto-test 退出码驱动)。
