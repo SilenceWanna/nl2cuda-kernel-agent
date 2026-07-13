@@ -63,12 +63,18 @@ done
 [ -d "$WORKDIR/cases/$CASE" ] || { echo "找不到 cases/$CASE（workdir=$WORKDIR）" >&2; exit 2; }
 
 # ---- 每 case 默认 size env（把"短核固定开销陷阱"处理在脚本内，agent 无需知晓）----
+# 优先级：--size-env 命令行 > cases/<case>/bench.env 文件（case 自带，新 case 通用）> 内置默认。
+# bench.env 内容形如一行： SIZE_ENV="RMS_B=32768"  —— agent 建短核 case 时按约定放此文件即可，脚本无需改。
+if [ -z "$SIZE_ENV" ] && [ -f "$WORKDIR/cases/$CASE/bench.env" ]; then
+  # shellcheck disable=SC1090
+  SIZE_ENV="$(. "$WORKDIR/cases/$CASE/bench.env" 2>/dev/null; echo "${SIZE_ENV:-}")"
+fi
 if [ -z "$SIZE_ENV" ]; then
   case "$CASE" in
     rbf)        SIZE_ENV="RBF_SIZE=2048" ;;    # 非短核，与既有结果/config 默认一致
     layernorm)  SIZE_ENV="LN_B=32768" ;;       # 默认 B=4096 前向仅 0.06ms→加速比虚高；放大到 ≥0.2ms
     softmax_ce) SIZE_ENV="SMCE_B=8192" ;;      # 已 ≥0.2ms
-    *)          SIZE_ENV="" ;;
+    *)          SIZE_ENV="" ;;                 # 未知 case：靠 cases/<case>/bench.env 声明（见上）
   esac
 fi
 # 逗号转空格，供远程 env 使用（K=V,K=V → K=V K=V）

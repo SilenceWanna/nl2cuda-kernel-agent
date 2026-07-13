@@ -27,6 +27,9 @@
    - `__init__.py`：组装 `CASE`（7 字段）。
    - `kernels/*.cu`：前向 + 反向 kernel。**反向公式用户不会给——按 SKILL.md 技巧库自主推导**（autograd 对拍校验）。
    - `op.py`：`torch.autograd.Function` 封装为 `candidate(inputs, params)`。
+   - **短核 case 必加 `cases/<name>/bench.env`**（内容一行，如 `SIZE_ENV="RMS_B=32768"`）：若默认规模下核很短
+     （前/反向 <0.2ms，如归一化类默认 B=4096 时前向仅 0.06ms），计时会因固定开销虚高、CV 抖动。`run_on_a100.sh`
+     会自动读该文件放大规模测。config.py 要让规模支持对应 env 覆盖（如 `B=int(os.environ.get("RMS_B","4096"))`）。
 4. **自测（自动，无需用户提）**：跑 `bash skill/scripts/run_on_a100.sh <name> --gpu 7 --strict`
    （首次加 `--sync-cli`）。它在远程 GPU 跑 verify+bench，末行给 `VERDICT=`。按 `skill/AUTONOMOUS_LOOP.md` 的
    VERDICT 决策：`PASS`→交付；`VERIFY_FAIL`→修正确性（不看 bench）；`BENCH_FAIL`→按 `skill/loop.md` 优化未达标侧 kernel；
