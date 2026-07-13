@@ -16,6 +16,10 @@ yes-always: true
 auto-commits: true
 auto-test: true
 test-cmd: "bash skill/scripts/autotest.sh"
+# custom proxy model names are unknown to aider -> suppress the warning page (portable)
+show-model-warnings: false
+check-model-accepts-settings: false
+analytics: false
 
 read:
   - CONVENTIONS.md
