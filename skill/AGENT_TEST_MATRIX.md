@@ -191,3 +191,28 @@ round-cap 未触顶、PASS 后计数清零，均已独立复验）。**证明 ag
 **真·全自主**优化 LayerNorm 前向（0.89×→float4 向量化路径），**3 连稳过：前 1.060/1.075/1.068×、反 ~1.19×**；
 且明确禁令下**未碰 op.py（没钻 codex 那个计时空子）、framework 零改动**。→ **三 agent 全自主路径全部实证：
 gptme(WSL shell) / codex(内置shell) / aider(--auto-test 退出码驱动)。**
+
+## 8. 阶段7 用户输入极简化（方法论内化）+ 三宿主 RMSNorm 实测
+
+**目标**：用户只在 agent 界面输入算法定义，agent 靠内化的约定文件自动跑完全流程（不再手输长 prompt）。
+内化载体：`AGENTS.md`(codex 原生读)、`CONVENTIONS.md`+`.aider.conf.yml`(aider read/auto-test)、`CLAUDE.md`(Claude Code)、
+gptme 靠 `start_gptme.sh --system` 注入 AGENTS.md。配 `autotest.sh`(mtime 探测当前 case)+ `bench.env`(短核 case 自声明规模)。
+
+**三宿主用全新 case RMSNorm 实测（只输一句算法定义）**：
+| 宿主 | 内化方式 | 内化结果 | RMSNorm 达标 |
+|------|---------|---------|------------|
+| aider | `.aider.conf.yml` read + `--auto-test` | ✅ 零输入自建7文件+自主推导反向+自动自测 | 正确PASS；前向擦线抖动(1.047~1.076)不稳 |
+| gptme | `--system` 注入 AGENTS.md | ✅ 零输入自建+自主多轮循环(需命令式措辞+"别停") | 正确PASS；反向 reduce 天花板~1.0× |
+| codex | 原生读 AGENTS.md | ✅ 零输入自建+主动加bench.env+主动3次自测(读到"稳定过线") | 正确PASS；反向擦线抖动(1.047~1.070)不稳 |
+
+**结论**：**阶段7 内化在三宿主全部成功**——用户只给算法定义，agent 自动读 SKILL/建 case/写实现/自主推导反向/自测/优化，
+全程无需手输方法论，均守防作弊红线（含 op.py 无计时特化）。
+
+**算法优化空间洞察（关键，跨所有测试一致）**：agent 能否稳定达标 5% **取决于算法本身有无优化空间**，与内化/宿主无关：
+- **距离/矩阵类（RBF）**：广播式参考物化大中间量、手写融合 kernel 空间大 → **稳赢**（反向曾 1.4~3.9×）。
+- **归一化/reduce 类（LayerNorm 前向、RMSNorm 前反向）**：reduce 密集、torch.compile 已接近最优 → **卡 1.05 线抖动**，
+  三宿主一致（aider 前向、gptme/codex 反向都卡）。这是**算法固有难度**，不是 skill/agent 缺陷；稳定过线规则正确拦下擦线。
+
+**跨平台基建修复（阶段7 实测暴露，均已修）**：conf 注释纯 ASCII(免 GBK 崩)、conf 不写死 model(通用)、
+`.gitattributes` 强制 .sh 用 LF(免 CRLF 崩 bash)、autotest 用 mtime 探测(免 CRLF 误判)、bench.env 通用化(新短核 case 免改脚本)、
+start_gptme model 用 env 覆盖(避限流)。
