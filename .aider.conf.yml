@@ -1,0 +1,23 @@
+# .aider.conf.yml — aider 默认配置（阶段7：零配置全自主）
+# aider 在仓库根自动加载本文件。配合 CONVENTIONS.md，用户只需在 aider 界面输入算法定义即可。
+#
+# 说明：
+# - model / OPENAI_API_BASE 走 dongcc 内网代理；实跑前确保代理在 127.0.0.1:8787。
+# - auto-test + test-cmd：每次改完自动跑远程 A100 verify+bench；autotest.sh 自动探测当前在做的 case、
+#   透传 --strict 退出码（PASS=0 aider 停 / 否则非0 aider 读输出继续修）→ 实现 --auto-test 全自主闭环。
+# - read: 启动即把约定/方法论/自测规范加入只读上下文，agent 无需用户手动喂。
+
+model: openai/GPT-5.5-joybuilder
+model-settings-file: .aider.model.settings.yml
+
+yes-always: true
+auto-commits: true
+auto-test: true
+test-cmd: "bash skill/scripts/autotest.sh"
+
+# 启动即加载（只读）：约定 + skill 方法论 + 自主闭环规范
+read:
+  - CONVENTIONS.md
+  - skill/SKILL.md
+  - skill/AUTONOMOUS_LOOP.md
+  - skill/loop.md
