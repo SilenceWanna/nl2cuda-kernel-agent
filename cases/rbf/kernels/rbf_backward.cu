@@ -15,7 +15,83 @@ namespace {
     CHECK_FLOAT32(x);  \
     CHECK_CONTIGUOUS(x)
 
+constexpr int D64 = 64;
+constexpr int THREADS_D64 = 256;
+constexpr int GROUPS_D64 = THREADS_D64 / D64;
 
+__global__ __launch_bounds__(THREADS_D64, 2) void rbf_backward_dx_d64_kernel(
+    const float* __restrict__ grad_out,
+    const float* __restrict__ K,
+    const float* __restrict__ X,
+    const float* __restrict__ Y,
+    float* __restrict__ dX,
+    int N,
+    int M,
+    float scale) {
+    const int i = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int d = tid & (D64 - 1);
+    const int lane_group = tid >> 6;
+
+    __shared__ float partial[GROUPS_D64][D64];
+
+    const float xv = X[i * D64 + d];
+    float acc = 0.0f;
+
+    for (int j = lane_group; j < M; j += GROUPS_D64) {
+        const float coeff = scale * grad_out[i * M + j] * K[i * M + j];
+        acc += coeff * (xv - Y[j * D64 + d]);
+    }
+
+    partial[lane_group][d] = acc;
+    __syncthreads();
+
+    if (lane_group == 0) {
+        float sum = partial[0][d];
+#pragma unroll
+        for (int g = 1; g < GROUPS_D64; ++g) {
+            sum += partial[g][d];
+        }
+        dX[i * D64 + d] = sum;
+    }
+}
+
+__global__ __launch_bounds__(THREADS_D64, 2) void rbf_backward_dy_d64_kernel(
+    const float* __restrict__ grad_out,
+    const float* __restrict__ K,
+    const float* __restrict__ X,
+    const float* __restrict__ Y,
+    float* __restrict__ dY,
+    int N,
+    int M,
+    float scale) {
+    const int j = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int d = tid & (D64 - 1);
+    const int lane_group = tid >> 6;
+
+    __shared__ float partial[GROUPS_D64][D64];
+
+    const float yv = Y[j * D64 + d];
+    float acc = 0.0f;
+
+    for (int i = lane_group; i < N; i += GROUPS_D64) {
+        const float coeff = -scale * grad_out[i * M + j] * K[i * M + j];
+        acc += coeff * (X[i * D64 + d] - yv);
+    }
+
+    partial[lane_group][d] = acc;
+    __syncthreads();
+
+    if (lane_group == 0) {
+        float sum = partial[0][d];
+#pragma unroll
+        for (int g = 1; g < GROUPS_D64; ++g) {
+            sum += partial[g][d];
+        }
+        dY[j * D64 + d] = sum;
+    }
+}
 
 __global__ void rbf_backward_dx_kernel(
     const float* __restrict__ grad_out,
@@ -104,31 +180,56 @@ std::vector<torch::Tensor> rbf_backward(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    const int threads = 256;
-    const int dx_blocks = (N * D + threads - 1) / threads;
-    const int dy_blocks = (M * D + threads - 1) / threads;
-    rbf_backward_dx_kernel<<<dx_blocks, threads, 0, stream>>>(
-        grad_out.data_ptr<float>(),
-        K.data_ptr<float>(),
-        X.data_ptr<float>(),
-        Y.data_ptr<float>(),
-        dX.data_ptr<float>(),
-        N,
-        M,
-        D,
-        static_cast<float>(gamma));
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    rbf_backward_dy_kernel<<<dy_blocks, threads, 0, stream>>>(
-        grad_out.data_ptr<float>(),
-        K.data_ptr<float>(),
-        X.data_ptr<float>(),
-        Y.data_ptr<float>(),
-        dY.data_ptr<float>(),
-        N,
-        M,
-        D,
-        static_cast<float>(gamma));
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if (D == D64) {
+        const float scale = -2.0f * static_cast<float>(gamma);
+        rbf_backward_dx_d64_kernel<<<N, THREADS_D64, 0, stream>>>(
+            grad_out.data_ptr<float>(),
+            K.data_ptr<float>(),
+            X.data_ptr<float>(),
+            Y.data_ptr<float>(),
+            dX.data_ptr<float>(),
+            N,
+            M,
+            scale);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+        rbf_backward_dy_d64_kernel<<<M, THREADS_D64, 0, stream>>>(
+            grad_out.data_ptr<float>(),
+            K.data_ptr<float>(),
+            X.data_ptr<float>(),
+            Y.data_ptr<float>(),
+            dY.data_ptr<float>(),
+            N,
+            M,
+            scale);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    } else {
+        const int threads = 256;
+        const int dx_blocks = (N * D + threads - 1) / threads;
+        const int dy_blocks = (M * D + threads - 1) / threads;
+        rbf_backward_dx_kernel<<<dx_blocks, threads, 0, stream>>>(
+            grad_out.data_ptr<float>(),
+            K.data_ptr<float>(),
+            X.data_ptr<float>(),
+            Y.data_ptr<float>(),
+            dX.data_ptr<float>(),
+            N,
+            M,
+            D,
+            static_cast<float>(gamma));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        rbf_backward_dy_kernel<<<dy_blocks, threads, 0, stream>>>(
+            grad_out.data_ptr<float>(),
+            K.data_ptr<float>(),
+            X.data_ptr<float>(),
+            Y.data_ptr<float>(),
+            dY.data_ptr<float>(),
+            N,
+            M,
+            D,
+            static_cast<float>(gamma));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
 
     return {dX, dY};
 }
