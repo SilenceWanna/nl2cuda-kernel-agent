@@ -16,27 +16,17 @@ ROUND_CAP="${ROUND_CAP:-12}"
 
 cd "$REPO" || { echo "VERDICT=SSH_ERROR (repo not found)"; exit 1; }
 
-# ① 有未提交改动（含未跟踪）的 case 目录
-CANDIDATES="$(git status --porcelain -- cases/ 2>/dev/null | awk '{print $NF}' \
-  | sed -n 's#^cases/\([^/]*\)/.*#\1#p' | sort -u)"
+# 探测"当前在做的 case"。优先按**最近修改时间**（mtime，不受 CRLF 影响）——
+# 跨文件系统（Windows↔WSL /mnt）时 git status 会把纯行尾差异误报为全 case 改动，故不用 git status。
+# 取 cases/<name>/ 下最近被改过的文件所属的那个 case。
+NEWEST="$(find cases -type f \( -name '*.cu' -o -name '*.py' \) -not -path '*/delivery/*' \
+  -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | sed -n 's#.* cases/\([^/]*\)/.*#\1#p')"
 
-# ② 回退：最近修改的 case（按 kernels/op.py mtime）
-if [ -z "$CANDIDATES" ]; then
-  CANDIDATES="$(ls -1t cases/*/op.py 2>/dev/null | sed -n 's#^cases/\([^/]*\)/op.py#\1#p' | head -1)"
-fi
-
-N="$(echo "$CANDIDATES" | grep -c .)"
-if [ "$N" -eq 0 ]; then
-  echo "autotest: 未找到任何 case（cases/ 下无改动也无 op.py）" >&2
+CASE="$NEWEST"
+if [ -z "$CASE" ]; then
+  echo "autotest: 未找到任何 case（cases/ 下无 .cu/.py）" >&2
   echo "VERDICT=SSH_ERROR (no case detected)"; exit 1
 fi
-if [ "$N" -gt 1 ]; then
-  echo "autotest: 探测到多个改动中的 case，无法确定目标：" >&2
-  echo "$CANDIDATES" >&2
-  echo "  请只改一个 case，或直接指定：bash skill/scripts/run_on_a100.sh <case> --gpu $GPU --strict" >&2
-  echo "VERDICT=SSH_ERROR (ambiguous case)"; exit 1
-fi
 
-CASE="$(echo "$CANDIDATES" | tr -d '[:space:]')"
-echo "[autotest] 目标 case=$CASE  gpu=$GPU  round-cap=$ROUND_CAP" >&2
+echo "[autotest] 目标 case=$CASE（按最近修改时间探测）  gpu=$GPU  round-cap=$ROUND_CAP" >&2
 exec bash "$SCRIPT_DIR/run_on_a100.sh" "$CASE" --gpu "$GPU" --strict --round-cap "$ROUND_CAP"

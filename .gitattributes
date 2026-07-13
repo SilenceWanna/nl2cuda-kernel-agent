@@ -1,0 +1,11 @@
+# 强制 shell 脚本用 LF 换行——否则 Windows 上 git clone(autocrlf)会转成 CRLF，
+# 导致 WSL/bash 解析报 "set: pipefail invalid option" / "$'\r' command not found"。
+*.sh text eol=lf
+
+# 源码文本统一 LF（跨平台一致，避免 CRLF 误判 framework 脏等问题）
+*.py text eol=lf
+*.cu text eol=lf
+*.cuh text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
