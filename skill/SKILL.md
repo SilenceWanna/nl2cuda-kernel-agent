@@ -175,6 +175,8 @@ python skill/scripts/bench_case.py --case <name>
 
 - 正确性：≥5 组随机输入，前向 + 每个 `grad_inputs` 的反向梯度均 `allclose(atol=rtol=1e-2)`。
 - 性能：前向、反向各自相对 `torch.compile`（默认 mode）≥1.05×，3 次重跑 CV≤5%。
+- **稳定过线**：加速比擦线（1.05–1.10× 区间）时，单次 PASS 不算达标——须连跑 3 次全 PASS 才算真达标；
+  共享/繁忙 GPU 上擦线加速比会在达标线上下抖动，达标应留安全余量（目标 ≥1.10×）而非骑在 1.05 线。
 - 两者同时满足即达成。
 
 ## 新增一个算法 case
