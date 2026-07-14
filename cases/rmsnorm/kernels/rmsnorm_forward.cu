@@ -115,7 +115,3 @@ std::vector<torch::Tensor> rmsnorm_forward(
 
     return {y, inv_rms};
 }
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("rmsnorm_forward", &rmsnorm_forward, "RMSNorm forward (CUDA)");
-}

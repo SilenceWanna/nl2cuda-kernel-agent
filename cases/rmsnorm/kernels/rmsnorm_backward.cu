@@ -5,6 +5,12 @@
 
 #include <vector>
 
+std::vector<torch::Tensor> rmsnorm_forward(
+    torch::Tensor x,
+    torch::Tensor gamma,
+    double eps
+);
+
 namespace {
 
 constexpr int THREADS = 256;
@@ -160,4 +166,9 @@ std::vector<torch::Tensor> rmsnorm_backward(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     return {grad_x, grad_gamma};
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("rmsnorm_forward", &rmsnorm_forward, "RMSNorm forward (CUDA)");
+    m.def("rmsnorm_backward", &rmsnorm_backward, "RMSNorm backward (CUDA)");
 }
