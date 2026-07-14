@@ -9,7 +9,6 @@ namespace {
 
 constexpr int DX_THREADS = 256;
 constexpr int DG_COLS = 256;
-constexpr int DG_ROWS_PER_BLOCK = 8;
 
 __inline__ __device__ float warp_reduce_sum(float val) {
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -88,20 +87,14 @@ __global__ void rmsnorm_backward_dgamma_kernel(
     int D
 ) {
     int col = blockIdx.x * blockDim.x + threadIdx.x;
-    int row_start = blockIdx.y * DG_ROWS_PER_BLOCK;
-
     if (col >= D) {
         return;
     }
 
     float sum = 0.0f;
-    #pragma unroll
-    for (int i = 0; i < DG_ROWS_PER_BLOCK; ++i) {
-        int row = row_start + i;
-        if (row < B) {
-            long long idx = static_cast<long long>(row) * D + col;
-            sum += grad_y[idx] * (x[idx] * inv_rms[row]);
-        }
+    for (int row = blockIdx.y; row < B; row += gridDim.y) {
+        long long idx = static_cast<long long>(row) * D + col;
+        sum += grad_y[idx] * (x[idx] * inv_rms[row]);
     }
 
     atomicAdd(grad_gamma + col, sum);
@@ -158,7 +151,7 @@ std::vector<torch::Tensor> rmsnorm_backward(
     );
 
     dim3 dg_block(DG_COLS);
-    dim3 dg_grid((D + DG_COLS - 1) / DG_COLS, (B + DG_ROWS_PER_BLOCK - 1) / DG_ROWS_PER_BLOCK);
+    dim3 dg_grid((D + DG_COLS - 1) / DG_COLS, 8);
 
     rmsnorm_backward_dgamma_kernel<<<dg_grid, dg_block, 0, stream>>>(
         grad_y.data_ptr<float>(),
