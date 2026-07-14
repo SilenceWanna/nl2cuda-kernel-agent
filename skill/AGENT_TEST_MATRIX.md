@@ -246,9 +246,13 @@ start_gptme model 用 env 覆盖(避限流)。
 1. **决策层减盲试**（gptme）：从"盲试5种列规约卡死"→"profile诊断对症选手段"，机制验证成功。
 2. **纯输入暴露 bench.env 盲区**（aider）：漏建 bench.env → 被短核固定开销虚高骗（1.22×假象）→ 误判 PASS 收工。
    这是"输入只给算法定义"原则的价值——不喂方法论才暴露 agent 真实内化盲区。
-3. **skill 迭代见效**（codex）：据 aider 盲区**强化 skill**（AGENTS.md/SKILL.md 加"短核假象警惕：baseline<0.15ms却高加速比→
+3. **skill 迭代见效（codex）**：据 aider 盲区**强化 skill**（AGENTS.md/SKILL.md 加"短核假象警惕：baseline<0.15ms却高加速比→
    放大规模重测"）后，codex 用强化版**主动建 bench.env、没被骗、3连稳过有余量**——"实测暴露盲区→改 skill→再测见效"闭环。
+4. **强化吸收有宿主差异（aider 重测）**：aider 用**同一强化版**重测 RMSNorm——config 支持了 env（吸收了一半），
+   但**仍漏建 bench.env、仍被短核假象骗**（短核显 前1.22/反1.33 PASS，放大后真实 前0.99 FAIL/反1.08）；前向也没用诊断表引导的
+   float4+缓存（停在 0.99×）。**同一强化 codex 完全吸收、aider 只半吸收**——skill 改进对强宿主(codex)见效充分、对较弱宿主(aider)
+   只部分生效。**skill 质量是一维、宿主能力是另一维**，改 skill 有上限、堵不尽较弱宿主的执行力缺口。
 
 **阶段8 结论**：①"reduce 密集类天花板"是伪命题——诊断对+缓存复用即可破（8.2 手工版前1.09/反1.11~1.13 稳过）；
-②决策层让 agent 从盲试转对症诊断（减轮次）；③纯算法输入是暴露内化盲区的关键手段，据此迭代 skill 能层层堵漏
-（bench.env 短核警惕经 aider→强化→codex 验证生效）。op.py 无计时特化、framework 零改动全程独立复验。
+②决策层让 agent 从盲试转对症诊断（减轮次）；③纯算法输入是暴露内化盲区的关键手段，据此迭代 skill 能堵漏，
+但**吸收程度依宿主能力而异**（同一"短核警惕"强化：codex 完全吸收避坑、aider 仍半漏）。op.py 无计时特化、framework 零改动全程独立复验。
