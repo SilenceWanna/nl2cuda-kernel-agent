@@ -7,7 +7,9 @@
 
 namespace {
 
-constexpr int THREADS = 256;
+constexpr int DX_THREADS = 256;
+constexpr int DG_COLS = 256;
+constexpr int DG_ROWS_PER_BLOCK = 8;
 
 __inline__ __device__ float warp_reduce_sum(float val) {
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -34,13 +36,12 @@ __inline__ __device__ float block_reduce_sum(float val) {
     return val;
 }
 
-__global__ void rmsnorm_backward_fused_kernel(
+__global__ void rmsnorm_backward_dx_kernel(
     const float* __restrict__ grad_y,
     const float* __restrict__ x,
     const float* __restrict__ gamma,
     const float* __restrict__ inv_rms,
     float* __restrict__ grad_x,
-    float* __restrict__ grad_gamma,
     int B,
     int D
 ) {
@@ -73,11 +74,37 @@ __global__ void rmsnorm_backward_fused_kernel(
     float mean_dot = s_mean_dot;
     for (int col = threadIdx.x; col < D; col += blockDim.x) {
         float x_hat = x_row[col] * r;
-        float gy = gy_row[col];
-        float u = gy * gamma[col];
+        float u = gy_row[col] * gamma[col];
         gx_row[col] = r * (u - x_hat * mean_dot);
-        atomicAdd(grad_gamma + col, gy * x_hat);
     }
+}
+
+__global__ void rmsnorm_backward_dgamma_kernel(
+    const float* __restrict__ grad_y,
+    const float* __restrict__ x,
+    const float* __restrict__ inv_rms,
+    float* __restrict__ grad_gamma,
+    int B,
+    int D
+) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row_start = blockIdx.y * DG_ROWS_PER_BLOCK;
+
+    if (col >= D) {
+        return;
+    }
+
+    float sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < DG_ROWS_PER_BLOCK; ++i) {
+        int row = row_start + i;
+        if (row < B) {
+            long long idx = static_cast<long long>(row) * D + col;
+            sum += grad_y[idx] * (x[idx] * inv_rms[row]);
+        }
+    }
+
+    atomicAdd(grad_gamma + col, sum);
 }
 
 }  // namespace
@@ -120,12 +147,23 @@ std::vector<torch::Tensor> rmsnorm_backward(
 
     auto stream = at::cuda::getDefaultCUDAStream();
 
-    rmsnorm_backward_fused_kernel<<<B, THREADS, 0, stream>>>(
+    rmsnorm_backward_dx_kernel<<<B, DX_THREADS, 0, stream>>>(
         grad_y.data_ptr<float>(),
         x.data_ptr<float>(),
         gamma.data_ptr<float>(),
         inv_rms.data_ptr<float>(),
         grad_x.data_ptr<float>(),
+        B,
+        D
+    );
+
+    dim3 dg_block(DG_COLS);
+    dim3 dg_grid((D + DG_COLS - 1) / DG_COLS, (B + DG_ROWS_PER_BLOCK - 1) / DG_ROWS_PER_BLOCK);
+
+    rmsnorm_backward_dgamma_kernel<<<dg_grid, dg_block, 0, stream>>>(
+        grad_y.data_ptr<float>(),
+        x.data_ptr<float>(),
+        inv_rms.data_ptr<float>(),
         grad_gamma.data_ptr<float>(),
         B,
         D
