@@ -10,6 +10,7 @@ namespace {
 constexpr int DX_THREADS = 256;
 constexpr int DG_COLS = 256;
 constexpr int DG_ROWS = 8;
+constexpr int DX_ITEMS_PER_THREAD = 4;
 
 __inline__ __device__ float warp_reduce_sum(float val) {
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -56,11 +57,34 @@ __global__ void rmsnorm_backward_dx_kernel(
 
     float r = inv_rms[row];
 
+    float x_vals[DX_ITEMS_PER_THREAD];
+    float gy_vals[DX_ITEMS_PER_THREAD];
+    float xhat_vals[DX_ITEMS_PER_THREAD];
+    float u_vals[DX_ITEMS_PER_THREAD];
+
     float dot = 0.0f;
-    for (int col = threadIdx.x; col < D; col += blockDim.x) {
-        float x_hat = x_row[col] * r;
-        float u = gy_row[col] * gamma[col];
-        dot += u * x_hat;
+
+    #pragma unroll
+    for (int i = 0; i < DX_ITEMS_PER_THREAD; ++i) {
+        int col = threadIdx.x + i * blockDim.x;
+        if (col < D) {
+            float xv = x_row[col];
+            float gyv = gy_row[col];
+            float xhat = xv * r;
+            float u = gyv * gamma[col];
+
+            x_vals[i] = xv;
+            gy_vals[i] = gyv;
+            xhat_vals[i] = xhat;
+            u_vals[i] = u;
+
+            dot += u * xhat;
+        } else {
+            x_vals[i] = 0.0f;
+            gy_vals[i] = 0.0f;
+            xhat_vals[i] = 0.0f;
+            u_vals[i] = 0.0f;
+        }
     }
 
     dot = block_reduce_sum(dot);
@@ -72,10 +96,13 @@ __global__ void rmsnorm_backward_dx_kernel(
     __syncthreads();
 
     float mean_dot = s_mean_dot;
-    for (int col = threadIdx.x; col < D; col += blockDim.x) {
-        float x_hat = x_row[col] * r;
-        float u = gy_row[col] * gamma[col];
-        gx_row[col] = r * (u - x_hat * mean_dot);
+
+    #pragma unroll
+    for (int i = 0; i < DX_ITEMS_PER_THREAD; ++i) {
+        int col = threadIdx.x + i * blockDim.x;
+        if (col < D) {
+            gx_row[col] = r * (u_vals[i] - xhat_vals[i] * mean_dot);
+        }
     }
 }
 
