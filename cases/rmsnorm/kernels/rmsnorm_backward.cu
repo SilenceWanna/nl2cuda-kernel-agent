@@ -34,12 +34,13 @@ __inline__ __device__ float block_reduce_sum(float val) {
     return val;
 }
 
-__global__ void rmsnorm_backward_dx_kernel(
+__global__ void rmsnorm_backward_fused_kernel(
     const float* __restrict__ grad_y,
     const float* __restrict__ x,
     const float* __restrict__ gamma,
     const float* __restrict__ inv_rms,
     float* __restrict__ grad_x,
+    float* __restrict__ grad_gamma,
     int B,
     int D
 ) {
@@ -72,35 +73,10 @@ __global__ void rmsnorm_backward_dx_kernel(
     float mean_dot = s_mean_dot;
     for (int col = threadIdx.x; col < D; col += blockDim.x) {
         float x_hat = x_row[col] * r;
-        float u = gy_row[col] * gamma[col];
+        float gy = gy_row[col];
+        float u = gy * gamma[col];
         gx_row[col] = r * (u - x_hat * mean_dot);
-    }
-}
-
-__global__ void rmsnorm_backward_dgamma_kernel(
-    const float* __restrict__ grad_y,
-    const float* __restrict__ x,
-    const float* __restrict__ inv_rms,
-    float* __restrict__ grad_gamma,
-    int B,
-    int D
-) {
-    int col = blockIdx.x;
-    if (col >= D) {
-        return;
-    }
-
-    float sum = 0.0f;
-    for (int row = threadIdx.x; row < B; row += blockDim.x) {
-        long long idx = static_cast<long long>(row) * D + col;
-        float x_hat = x[idx] * inv_rms[row];
-        sum += grad_y[idx] * x_hat;
-    }
-
-    sum = block_reduce_sum(sum);
-
-    if (threadIdx.x == 0) {
-        grad_gamma[col] = sum;
+        atomicAdd(grad_gamma + col, gy * x_hat);
     }
 }
 
@@ -140,24 +116,16 @@ std::vector<torch::Tensor> rmsnorm_backward(
     const auto D = static_cast<int>(x.size(1));
 
     auto grad_x = torch::empty_like(x);
-    auto grad_gamma = torch::empty_like(gamma);
+    auto grad_gamma = torch::zeros_like(gamma);
 
     auto stream = at::cuda::getDefaultCUDAStream();
 
-    rmsnorm_backward_dx_kernel<<<B, THREADS, 0, stream>>>(
+    rmsnorm_backward_fused_kernel<<<B, THREADS, 0, stream>>>(
         grad_y.data_ptr<float>(),
         x.data_ptr<float>(),
         gamma.data_ptr<float>(),
         inv_rms.data_ptr<float>(),
         grad_x.data_ptr<float>(),
-        B,
-        D
-    );
-
-    rmsnorm_backward_dgamma_kernel<<<D, THREADS, 0, stream>>>(
-        grad_y.data_ptr<float>(),
-        x.data_ptr<float>(),
-        inv_rms.data_ptr<float>(),
         grad_gamma.data_ptr<float>(),
         B,
         D
