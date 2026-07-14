@@ -12,6 +12,9 @@
 namespace {
 
 constexpr int THREADS = 256;
+constexpr int COL_TILE = 32;
+constexpr int ROW_THREADS = 8;
+constexpr int ROW_TILE = 256;
 
 constexpr float GELU_C = 0.7978845608028654f;
 constexpr float GELU_A = 0.044715f;
@@ -60,46 +63,44 @@ __global__ void bias_gelu_from_matmul_kernel(
     }
 }
 
-__global__ void gelu_backward_pointwise_kernel(
+__global__ void gelu_backward_and_bias_grad_kernel(
     const float* __restrict__ grad_y,
     const float* __restrict__ z,
     float* __restrict__ grad_z,
-    int total
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < total) {
-        grad_z[idx] = grad_y[idx] * gelu_tanh_grad(z[idx]);
-    }
-}
-
-__global__ void grad_b_kernel(
-    const float* __restrict__ grad_z,
     float* __restrict__ grad_b,
     int m_size,
     int n_size
 ) {
-    int col = blockIdx.x;
-    int tid = threadIdx.x;
+    __shared__ float partial[ROW_THREADS][COL_TILE];
 
-    __shared__ float partial[THREADS];
-
+    int col = blockIdx.x * COL_TILE + threadIdx.x;
+    int row_start = blockIdx.y * ROW_TILE;
     float acc = 0.0f;
-    for (int row = tid; row < m_size; row += blockDim.x) {
-        acc += grad_z[row * n_size + col];
+
+    if (col < n_size) {
+        for (int r = threadIdx.y; r < ROW_TILE; r += ROW_THREADS) {
+            int row = row_start + r;
+            if (row < m_size) {
+                int idx = row * n_size + col;
+                float gz = grad_y[idx] * gelu_tanh_grad(z[idx]);
+                grad_z[idx] = gz;
+                acc += gz;
+            }
+        }
     }
 
-    partial[tid] = acc;
+    partial[threadIdx.y][threadIdx.x] = acc;
     __syncthreads();
 
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            partial[tid] += partial[tid + stride];
-        }
-        __syncthreads();
-    }
+    if (threadIdx.y == 0 && col < n_size) {
+        float sum = 0.0f;
 
-    if (tid == 0) {
-        grad_b[col] = partial[0];
+        #pragma unroll
+        for (int i = 0; i < ROW_THREADS; ++i) {
+            sum += partial[i][threadIdx.x];
+        }
+
+        atomicAdd(grad_b + col, sum);
     }
 }
 
@@ -147,6 +148,7 @@ cublasHandle_t current_cublas_handle() {
 }
 
 void row_major_gemm_nn(
+    cublasHandle_t handle,
     const float* a,
     const float* b,
     float* c,
@@ -154,8 +156,6 @@ void row_major_gemm_nn(
     int n,
     int k
 ) {
-    cublasHandle_t handle = current_cublas_handle();
-
     const float alpha = 1.0f;
     const float beta = 0.0f;
 
@@ -178,6 +178,7 @@ void row_major_gemm_nn(
 }
 
 void row_major_gemm_nt(
+    cublasHandle_t handle,
     const float* a,
     const float* b,
     float* c,
@@ -185,8 +186,6 @@ void row_major_gemm_nt(
     int n,
     int k
 ) {
-    cublasHandle_t handle = current_cublas_handle();
-
     const float alpha = 1.0f;
     const float beta = 0.0f;
 
@@ -209,6 +208,7 @@ void row_major_gemm_nt(
 }
 
 void row_major_gemm_tn(
+    cublasHandle_t handle,
     const float* a,
     const float* b,
     float* c,
@@ -216,8 +216,6 @@ void row_major_gemm_tn(
     int n,
     int k
 ) {
-    cublasHandle_t handle = current_cublas_handle();
-
     const float alpha = 1.0f;
     const float beta = 0.0f;
 
@@ -256,7 +254,10 @@ std::vector<torch::Tensor> gemm_bias_gelu_forward(
     auto y = torch::empty({m_size, n_size}, x.options());
     auto z = torch::empty({m_size, n_size}, x.options());
 
+    cublasHandle_t handle = current_cublas_handle();
+
     row_major_gemm_nn(
+        handle,
         x.data_ptr<float>(),
         w.data_ptr<float>(),
         z.data_ptr<float>(),
@@ -289,23 +290,31 @@ std::vector<torch::Tensor> gemm_bias_gelu_backward(
     int m_size = static_cast<int>(x.size(0));
     int k_size = static_cast<int>(x.size(1));
     int n_size = static_cast<int>(w.size(1));
-    int total = m_size * n_size;
 
     auto grad_z = torch::empty({m_size, n_size}, x.options());
     auto grad_x = torch::empty_like(x);
     auto grad_w = torch::empty_like(w);
     auto grad_b = torch::empty({n_size}, x.options());
 
-    int pointwise_blocks = (total + THREADS - 1) / THREADS;
-    gelu_backward_pointwise_kernel<<<pointwise_blocks, THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    C10_CUDA_CHECK(cudaMemsetAsync(grad_b.data_ptr<float>(), 0, n_size * sizeof(float), stream));
+
+    dim3 db_block(COL_TILE, ROW_THREADS);
+    dim3 db_grid((n_size + COL_TILE - 1) / COL_TILE, (m_size + ROW_TILE - 1) / ROW_TILE);
+    gelu_backward_and_bias_grad_kernel<<<db_grid, db_block, 0, stream>>>(
         grad_y.data_ptr<float>(),
         z.data_ptr<float>(),
         grad_z.data_ptr<float>(),
-        total
+        grad_b.data_ptr<float>(),
+        m_size,
+        n_size
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
+    cublasHandle_t handle = current_cublas_handle();
+
     row_major_gemm_nt(
+        handle,
         grad_z.data_ptr<float>(),
         w.data_ptr<float>(),
         grad_x.data_ptr<float>(),
@@ -315,6 +324,7 @@ std::vector<torch::Tensor> gemm_bias_gelu_backward(
     );
 
     row_major_gemm_tn(
+        handle,
         x.data_ptr<float>(),
         grad_z.data_ptr<float>(),
         grad_w.data_ptr<float>(),
@@ -322,14 +332,6 @@ std::vector<torch::Tensor> gemm_bias_gelu_backward(
         n_size,
         m_size
     );
-
-    grad_b_kernel<<<n_size, THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
-        grad_z.data_ptr<float>(),
-        grad_b.data_ptr<float>(),
-        m_size,
-        n_size
-    );
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     return {grad_x, grad_w, grad_b};
 }
