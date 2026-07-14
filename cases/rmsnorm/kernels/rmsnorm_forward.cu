@@ -6,6 +6,13 @@
 #include <cmath>
 #include <vector>
 
+std::vector<torch::Tensor> rmsnorm_backward(
+    torch::Tensor grad_y,
+    torch::Tensor x,
+    torch::Tensor gamma,
+    torch::Tensor inv_rms
+);
+
 namespace {
 
 constexpr int THREADS = 256;
@@ -112,4 +119,5 @@ std::vector<torch::Tensor> rmsnorm_forward(torch::Tensor x, torch::Tensor gamma,
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rmsnorm_forward", &rmsnorm_forward, "RMSNorm forward (CUDA)");
+    m.def("rmsnorm_backward", &rmsnorm_backward, "RMSNorm backward (CUDA)");
 }

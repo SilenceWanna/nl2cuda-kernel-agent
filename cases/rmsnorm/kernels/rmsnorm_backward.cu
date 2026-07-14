@@ -161,7 +161,3 @@ std::vector<torch::Tensor> rmsnorm_backward(
 
     return {grad_x, grad_gamma};
 }
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("rmsnorm_backward", &rmsnorm_backward, "RMSNorm backward (CUDA)");
-}
