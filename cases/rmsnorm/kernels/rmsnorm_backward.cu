@@ -12,8 +12,6 @@ std::vector<torch::Tensor> rmsnorm_forward(
 namespace {
 
 constexpr int kBlockSize = 256;
-constexpr int kColTile = 32;
-constexpr int kRowTile = 8;
 
 __inline__ __device__ float warp_reduce_sum(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -36,14 +34,13 @@ __inline__ __device__ float block_reduce_sum(float v) {
     }
     __syncthreads();
 
-    v = (threadIdx.x < num_warps) ? shared[lane] : 0.0f;
-
+    float out = 0.0f;
     if (wid == 0) {
-        v = warp_reduce_sum(v);
-    }
-
-    if (threadIdx.x == 0) {
-        shared[0] = v;
+        out = (lane < num_warps) ? shared[lane] : 0.0f;
+        out = warp_reduce_sum(out);
+        if (lane == 0) {
+            shared[0] = out;
+        }
     }
     __syncthreads();
 
@@ -83,13 +80,6 @@ __global__ void rmsnorm_backward_x_kernel(
     }
 }
 
-__global__ void zero_vector_kernel(float* __restrict__ a, int D) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < D) {
-        a[i] = 0.0f;
-    }
-}
-
 __global__ void rmsnorm_backward_gamma_kernel(
     const float* __restrict__ grad_y,
     const float* __restrict__ x,
@@ -97,25 +87,21 @@ __global__ void rmsnorm_backward_gamma_kernel(
     float* __restrict__ grad_gamma,
     int B,
     int D) {
-    const int col = blockIdx.x * blockDim.x + threadIdx.x;
-    const int row_start = blockIdx.y * kRowTile;
-
+    const int col = blockIdx.x;
     if (col >= D) {
         return;
     }
 
     float sum_gamma = 0.0f;
-
-#pragma unroll
-    for (int r = 0; r < kRowTile; ++r) {
-        const int b = row_start + r;
-        if (b < B) {
-            const int idx = b * D + col;
-            sum_gamma += grad_y[idx] * (x[idx] * inv_rms[b]);
-        }
+    for (int b = threadIdx.x; b < B; b += blockDim.x) {
+        const int idx = b * D + col;
+        sum_gamma += grad_y[idx] * x[idx] * inv_rms[b];
     }
 
-    atomicAdd(grad_gamma + col, sum_gamma);
+    const float total = block_reduce_sum(sum_gamma);
+    if (threadIdx.x == 0) {
+        grad_gamma[col] = total;
+    }
 }
 
 void check_backward_inputs(
@@ -160,11 +146,9 @@ std::vector<torch::Tensor> rmsnorm_backward(
     auto grad_x = torch::empty_like(x);
     auto grad_gamma = torch::empty_like(gamma);
 
-    zero_vector_kernel<<<(D + kBlockSize - 1) / kBlockSize, kBlockSize>>>(
-        grad_gamma.data_ptr<float>(),
-        D);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    rmsnorm_backward_x_kernel<<<B, kBlockSize>>>(
+    rmsnorm_backward_x_kernel<<<B, kBlockSize, 0, stream>>>(
         grad_y.data_ptr<float>(),
         x.data_ptr<float>(),
         gamma.data_ptr<float>(),
@@ -173,9 +157,7 @@ std::vector<torch::Tensor> rmsnorm_backward(
         B,
         D);
 
-    const dim3 gamma_block(kColTile);
-    const dim3 gamma_grid((D + kColTile - 1) / kColTile, (B + kRowTile - 1) / kRowTile);
-    rmsnorm_backward_gamma_kernel<<<gamma_grid, gamma_block>>>(
+    rmsnorm_backward_gamma_kernel<<<D, kBlockSize, 0, stream>>>(
         grad_y.data_ptr<float>(),
         x.data_ptr<float>(),
         inv_rms.data_ptr<float>(),
