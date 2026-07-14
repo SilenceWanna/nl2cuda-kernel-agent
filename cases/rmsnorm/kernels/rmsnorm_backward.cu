@@ -85,18 +85,23 @@ __global__ void rmsnorm_backward_dgamma_kernel(
     int B,
     int D
 ) {
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int col = blockIdx.x;
     if (col >= D) {
         return;
     }
 
     float sum = 0.0f;
-    for (int row = 0; row < B; ++row) {
+    for (int row = threadIdx.x; row < B; row += blockDim.x) {
         long long idx = static_cast<long long>(row) * D + col;
         float x_hat = x[idx] * inv_rms[row];
         sum += grad_y[idx] * x_hat;
     }
-    grad_gamma[col] = sum;
+
+    sum = block_reduce_sum(sum);
+
+    if (threadIdx.x == 0) {
+        grad_gamma[col] = sum;
+    }
 }
 
 }  // namespace
@@ -149,8 +154,7 @@ std::vector<torch::Tensor> rmsnorm_backward(
         D
     );
 
-    const int blocks = (D + THREADS - 1) / THREADS;
-    rmsnorm_backward_dgamma_kernel<<<blocks, THREADS, 0, stream>>>(
+    rmsnorm_backward_dgamma_kernel<<<D, THREADS, 0, stream>>>(
         grad_y.data_ptr<float>(),
         x.data_ptr<float>(),
         inv_rms.data_ptr<float>(),
