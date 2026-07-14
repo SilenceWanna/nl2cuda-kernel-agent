@@ -14,6 +14,8 @@ std::vector<torch::Tensor> rmsnorm_forward(
 namespace {
 
 constexpr int THREADS = 256;
+constexpr int DGAMMA_COLS_PER_BLOCK = 256;
+constexpr int DGAMMA_ROWS_PER_BLOCK = 8;
 
 __inline__ __device__ float warp_sum(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -90,17 +92,25 @@ __global__ void rmsnorm_backward_dgamma_kernel(
     int rows,
     int cols
 ) {
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int col = blockIdx.x * DGAMMA_COLS_PER_BLOCK + threadIdx.x;
+    int row_start = blockIdx.y * DGAMMA_ROWS_PER_BLOCK;
+
     if (col >= cols) {
         return;
     }
 
     float sum = 0.0f;
-    for (int row = 0; row < rows; ++row) {
+    int row_end = row_start + DGAMMA_ROWS_PER_BLOCK;
+    if (row_end > rows) {
+        row_end = rows;
+    }
+
+    for (int row = row_start; row < row_end; ++row) {
         long long idx = static_cast<long long>(row) * cols + col;
         sum += grad_y[idx] * x[idx] * inv_rms[row];
     }
-    grad_gamma[col] = sum;
+
+    atomicAdd(grad_gamma + col, sum);
 }
 
 }  // namespace
@@ -139,7 +149,7 @@ std::vector<torch::Tensor> rmsnorm_backward(
     const auto cols = static_cast<int>(x.size(1));
 
     auto grad_x = torch::empty_like(x);
-    auto grad_gamma = torch::empty_like(gamma);
+    auto grad_gamma = torch::zeros_like(gamma);
 
     auto stream = at::cuda::getDefaultCUDAStream();
 
@@ -154,8 +164,12 @@ std::vector<torch::Tensor> rmsnorm_backward(
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    const int blocks_gamma = (cols + THREADS - 1) / THREADS;
-    rmsnorm_backward_dgamma_kernel<<<blocks_gamma, THREADS, 0, stream>>>(
+    dim3 block(DGAMMA_COLS_PER_BLOCK);
+    dim3 grid(
+        (cols + DGAMMA_COLS_PER_BLOCK - 1) / DGAMMA_COLS_PER_BLOCK,
+        (rows + DGAMMA_ROWS_PER_BLOCK - 1) / DGAMMA_ROWS_PER_BLOCK
+    );
+    rmsnorm_backward_dgamma_kernel<<<grid, block, 0, stream>>>(
         grad_y.data_ptr<float>(),
         x.data_ptr<float>(),
         inv_rms.data_ptr<float>(),
