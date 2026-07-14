@@ -7,7 +7,8 @@
 ```
 1. bench   → python skill/scripts/bench_case.py --case <name>
              读当前前/反向加速比、baseline 绝对耗时、CV。
-2. 诊断    → 定位瓶颈（见下"优化手段"），选一项改动。
+2. 诊断    → **先用 `profile_case.py` 看瓶颈信号，据 SKILL.md "瓶颈诊断→策略选择"表直接选对应手段**
+             （别从头顺着清单盲试——那会多花好几轮）。前/反向分别诊断，先攻未达标那侧。
 3. 改 kernel → 只改 cases/<name>/kernels/*.cu（及 op.py 封装），不动 framework/。
 4. verify  → python skill/scripts/verify_case.py --case <name>
              必须仍前反向全 PASS（allclose）。不过则回退本轮改动。
@@ -22,11 +23,13 @@
 
 ## 优化手段（按预期收益排序，据 profile 选择；做法细节见 SKILL.md "CUDA Kernel 实现技巧"）
 
+> **优化前必先诊断**（见循环体第 2 步 + SKILL.md "瓶颈诊断→策略选择"表）。以下按经验收益排序，但**应据诊断的瓶颈类型跳到对应手段**，不必顺序全试。
+
 1. **提高 occupancy（常最先做）**：朴素版若"一线程一行/一输出"，线程数不足喂满 SM。降 block 到 256 线程、每线程算多个输出（thread coarsening），占用率常从 ~50% 提到满。—— 前向优化实测：这一招把 RBF 前向 4.5→2.3ms。
-2. **前向缓存复用**：反向若重算了前向中间量（dist/K、softmax、mean/std），改为 `ctx.save_for_backward` 存、反向读。—— 实测：RBF 反向靠此从 21.6ms→2.6ms（决定性一招）。
+2. **前向缓存复用**：反向若重算了前向中间量（dist/K、softmax、mean/std），改为 `ctx.save_for_backward` 存、反向读。—— 实测：RBF 反向靠此从 21.6ms→2.6ms；**LayerNorm 反向靠缓存 mean/rstd 消除朴素 O(B·D²) 重算，从 ~1.0×→1.11×（决定性一招，reduce 密集类也能借此翻盘）**。
 3. **算子融合 / 避免物化**：多步（距离→exp、norm→仿射）融进一个 kernel，别物化 [N,M,D] 大中间量——这是相对广播式参考的内存带宽优势来源。
-4. **shared-memory tiling**：一个 block 协作把输入分块载入 shared 复用，减少全局重复读。**注意**：对 D 很小的问题（如 D=64）收益可能有限甚至被同步开销抵消——先测再上，别想当然。
-5. **float4 向量化**：连续维用 `float4` 一次读 4 个（16B 对齐）。收益视问题是否访存瓶颈而定。
+4. **shared-memory tiling / 列规约二维分块**：一个 block 协作把输入分块载入 shared 复用。**列规约（如 dgamma/dbeta=Σ_b）用二维分块（行块×连续列、行主序合并读、atomicAdd 跨行块）** —— 实测让 LayerNorm dgamma/dbeta 反向达标。**注意**：对 D 很小（如 D=64）tiling 收益可能被同步开销抵消——先测再上。
+5. **float4 向量化 + 寄存器缓存**：连续维用 `float4` 一次读 4 个（16B 对齐）。**若同一数据要多遍读（如 LayerNorm 前向读 X 三遍求 mean/var/写 Y），把本线程负责的元素缓存进寄存器只读一遍** —— 实测把 LayerNorm 前向 0.93×→1.09×（突破"前向短核天花板"）。
 6. **warp 原语**：规约用 `__shfl_down_sync` 替代 shared 往返，减同步。
 
 > **重要经验**：优化前先用 `profile_case.py` 定位真瓶颈，别凭直觉套 tiling/float4。曾出现"以为是访存、实为 occupancy/固定开销"的误判——先测瓶颈，再对症下药。
