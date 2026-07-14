@@ -3,6 +3,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 
+#include <cublas_v2.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 
@@ -10,7 +11,6 @@
 
 namespace {
 
-constexpr int TILE = 16;
 constexpr int THREADS = 256;
 
 constexpr float GELU_C = 0.7978845608028654f;
@@ -19,10 +19,12 @@ constexpr float GELU_A = 0.044715f;
 #define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
 #define CHECK_FLOAT32(x) TORCH_CHECK((x).scalar_type() == torch::kFloat32, #x " must be float32")
-#define CHECK_INPUT(x) \
-    CHECK_CUDA(x);     \
-    CHECK_CONTIGUOUS(x); \
+#define CHECK_INPUT(x)      \
+    CHECK_CUDA(x);          \
+    CHECK_CONTIGUOUS(x);    \
     CHECK_FLOAT32(x)
+
+#define CHECK_CUBLAS(status) TORCH_CHECK((status) == CUBLAS_STATUS_SUCCESS, "cuBLAS call failed")
 
 __device__ __forceinline__ float gelu_tanh(float x) {
     float x2 = x * x;
@@ -42,48 +44,19 @@ __device__ __forceinline__ float gelu_tanh_grad(float x) {
     return 0.5f * (1.0f + t) + 0.5f * x * sech2 * du;
 }
 
-__global__ void gemm_bias_gelu_forward_kernel(
-    const float* __restrict__ x,
-    const float* __restrict__ w,
+__global__ void bias_gelu_from_matmul_kernel(
     const float* __restrict__ b,
-    float* __restrict__ y,
     float* __restrict__ z,
-    int m_size,
-    int k_size,
+    float* __restrict__ y,
+    int total,
     int n_size
 ) {
-    __shared__ float sx[TILE][TILE];
-    __shared__ float sw[TILE][TILE];
-
-    int row = blockIdx.y * TILE + threadIdx.y;
-    int col = blockIdx.x * TILE + threadIdx.x;
-
-    float acc = 0.0f;
-
-    for (int t = 0; t < k_size; t += TILE) {
-        int x_col = t + threadIdx.x;
-        int w_row = t + threadIdx.y;
-
-        sx[threadIdx.y][threadIdx.x] =
-            (row < m_size && x_col < k_size) ? x[row * k_size + x_col] : 0.0f;
-
-        sw[threadIdx.y][threadIdx.x] =
-            (w_row < k_size && col < n_size) ? w[w_row * n_size + col] : 0.0f;
-
-        __syncthreads();
-
-        #pragma unroll
-        for (int i = 0; i < TILE; ++i) {
-            acc += sx[threadIdx.y][i] * sw[i][threadIdx.x];
-        }
-
-        __syncthreads();
-    }
-
-    if (row < m_size && col < n_size) {
-        float v = acc + b[col];
-        z[row * n_size + col] = v;
-        y[row * n_size + col] = gelu_tanh(v);
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total) {
+        int col = idx % n_size;
+        float v = z[idx] + b[col];
+        z[idx] = v;
+        y[idx] = gelu_tanh(v);
     }
 }
 
@@ -96,88 +69,6 @@ __global__ void gelu_backward_pointwise_kernel(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < total) {
         grad_z[idx] = grad_y[idx] * gelu_tanh_grad(z[idx]);
-    }
-}
-
-__global__ void grad_x_kernel(
-    const float* __restrict__ grad_z,
-    const float* __restrict__ w,
-    float* __restrict__ grad_x,
-    int m_size,
-    int k_size,
-    int n_size
-) {
-    __shared__ float sgz[TILE][TILE];
-    __shared__ float swt[TILE][TILE];
-
-    int row = blockIdx.y * TILE + threadIdx.y;
-    int col = blockIdx.x * TILE + threadIdx.x;
-
-    float acc = 0.0f;
-
-    for (int t = 0; t < n_size; t += TILE) {
-        int n_col = t + threadIdx.x;
-        int n_row = t + threadIdx.y;
-
-        sgz[threadIdx.y][threadIdx.x] =
-            (row < m_size && n_col < n_size) ? grad_z[row * n_size + n_col] : 0.0f;
-
-        swt[threadIdx.y][threadIdx.x] =
-            (col < k_size && n_row < n_size) ? w[col * n_size + n_row] : 0.0f;
-
-        __syncthreads();
-
-        #pragma unroll
-        for (int i = 0; i < TILE; ++i) {
-            acc += sgz[threadIdx.y][i] * swt[i][threadIdx.x];
-        }
-
-        __syncthreads();
-    }
-
-    if (row < m_size && col < k_size) {
-        grad_x[row * k_size + col] = acc;
-    }
-}
-
-__global__ void grad_w_kernel(
-    const float* __restrict__ x,
-    const float* __restrict__ grad_z,
-    float* __restrict__ grad_w,
-    int m_size,
-    int k_size,
-    int n_size
-) {
-    __shared__ float sxt[TILE][TILE];
-    __shared__ float sgz[TILE][TILE];
-
-    int row = blockIdx.y * TILE + threadIdx.y;
-    int col = blockIdx.x * TILE + threadIdx.x;
-
-    float acc = 0.0f;
-
-    for (int t = 0; t < m_size; t += TILE) {
-        int m_col = t + threadIdx.x;
-        int m_row = t + threadIdx.y;
-
-        sxt[threadIdx.y][threadIdx.x] =
-            (row < k_size && m_col < m_size) ? x[m_col * k_size + row] : 0.0f;
-
-        sgz[threadIdx.y][threadIdx.x] =
-            (m_row < m_size && col < n_size) ? grad_z[m_row * n_size + col] : 0.0f;
-
-        __syncthreads();
-
-        #pragma unroll
-        for (int i = 0; i < TILE; ++i) {
-            acc += sxt[threadIdx.y][i] * sgz[i][threadIdx.x];
-        }
-
-        __syncthreads();
-    }
-
-    if (row < k_size && col < n_size) {
-        grad_w[row * n_size + col] = acc;
     }
 }
 
@@ -248,6 +139,106 @@ void check_backward_inputs(
     TORCH_CHECK(z.size(1) == grad_y.size(1), "Z.shape[1] must equal grad_y.shape[1]");
 }
 
+cublasHandle_t current_cublas_handle() {
+    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+    CHECK_CUBLAS(cublasSetStream(handle, at::cuda::getCurrentCUDAStream()));
+    CHECK_CUBLAS(cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH));
+    return handle;
+}
+
+void row_major_gemm_nn(
+    const float* a,
+    const float* b,
+    float* c,
+    int m,
+    int n,
+    int k
+) {
+    cublasHandle_t handle = current_cublas_handle();
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    CHECK_CUBLAS(cublasSgemm(
+        handle,
+        CUBLAS_OP_N,
+        CUBLAS_OP_N,
+        n,
+        m,
+        k,
+        &alpha,
+        b,
+        n,
+        a,
+        k,
+        &beta,
+        c,
+        n
+    ));
+}
+
+void row_major_gemm_nt(
+    const float* a,
+    const float* b,
+    float* c,
+    int m,
+    int n,
+    int k
+) {
+    cublasHandle_t handle = current_cublas_handle();
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    CHECK_CUBLAS(cublasSgemm(
+        handle,
+        CUBLAS_OP_T,
+        CUBLAS_OP_N,
+        n,
+        m,
+        k,
+        &alpha,
+        b,
+        k,
+        a,
+        k,
+        &beta,
+        c,
+        n
+    ));
+}
+
+void row_major_gemm_tn(
+    const float* a,
+    const float* b,
+    float* c,
+    int m,
+    int n,
+    int k
+) {
+    cublasHandle_t handle = current_cublas_handle();
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    CHECK_CUBLAS(cublasSgemm(
+        handle,
+        CUBLAS_OP_N,
+        CUBLAS_OP_T,
+        n,
+        m,
+        k,
+        &alpha,
+        b,
+        n,
+        a,
+        m,
+        &beta,
+        c,
+        n
+    ));
+}
+
 }  // namespace
 
 std::vector<torch::Tensor> gemm_bias_gelu_forward(
@@ -260,21 +251,26 @@ std::vector<torch::Tensor> gemm_bias_gelu_forward(
     int m_size = static_cast<int>(x.size(0));
     int k_size = static_cast<int>(x.size(1));
     int n_size = static_cast<int>(w.size(1));
+    int total = m_size * n_size;
 
     auto y = torch::empty({m_size, n_size}, x.options());
     auto z = torch::empty({m_size, n_size}, x.options());
 
-    dim3 block(TILE, TILE);
-    dim3 grid((n_size + TILE - 1) / TILE, (m_size + TILE - 1) / TILE);
-
-    gemm_bias_gelu_forward_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+    row_major_gemm_nn(
         x.data_ptr<float>(),
         w.data_ptr<float>(),
-        b.data_ptr<float>(),
-        y.data_ptr<float>(),
         z.data_ptr<float>(),
         m_size,
-        k_size,
+        n_size,
+        k_size
+    );
+
+    int blocks = (total + THREADS - 1) / THREADS;
+    bias_gelu_from_matmul_kernel<<<blocks, THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+        b.data_ptr<float>(),
+        z.data_ptr<float>(),
+        y.data_ptr<float>(),
+        total,
         n_size
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -309,10 +305,7 @@ std::vector<torch::Tensor> gemm_bias_gelu_backward(
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    dim3 block(TILE, TILE);
-
-    dim3 grid_x((k_size + TILE - 1) / TILE, (m_size + TILE - 1) / TILE);
-    grad_x_kernel<<<grid_x, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+    row_major_gemm_nt(
         grad_z.data_ptr<float>(),
         w.data_ptr<float>(),
         grad_x.data_ptr<float>(),
@@ -320,18 +313,15 @@ std::vector<torch::Tensor> gemm_bias_gelu_backward(
         k_size,
         n_size
     );
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    dim3 grid_w((n_size + TILE - 1) / TILE, (k_size + TILE - 1) / TILE);
-    grad_w_kernel<<<grid_w, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+    row_major_gemm_tn(
         x.data_ptr<float>(),
         grad_z.data_ptr<float>(),
         grad_w.data_ptr<float>(),
-        m_size,
         k_size,
-        n_size
+        n_size,
+        m_size
     );
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     grad_b_kernel<<<n_size, THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
         grad_z.data_ptr<float>(),
