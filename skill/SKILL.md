@@ -141,6 +141,7 @@ python skill/scripts/bench_case.py --case <name>
 | 反向重算了前向已算过的中间量（mean/std、softmax、K…）| 重算 | **前向 `ctx` 缓存复用**(F)——反向决定性一招 |
 | 规约（sum/mean/max）占大头 | 规约低效 | warp shuffle 规约、两级归约、**列规约二维分块**(C) |
 | 朴素参考物化 [N,M,D] 等大张量 | 带宽/内存 | 融合不物化 (F) |
+| 算法是**累积/扫描依赖**（前缀和、cumsum、cumprod、扫描类）| 串行依赖 | 用成熟**并行扫描原语**（CUB `BlockScan`/`DeviceScan`，或 Hillis-Steele/Blelloch）；反向是**反向扫描**（`dx[j]=Σ_{i≥j} dy[i]`）。实测 scan 用 CUB block scan 前3.4×/反4.1× 大幅达标 |
 
 > **实测印证（LayerNorm 反向，曾被误判为"reduce 密集打不过 torch.compile 的天花板"）**：按上表诊断后三招组合即稳过 5%——
 > ①反向**缓存 mean/rstd**（前向输出、反向读，消除朴素 O(B·D²) 重算）反向 ~1.0×→1.11×；②dgamma/dbeta **二维分块列规约**；
