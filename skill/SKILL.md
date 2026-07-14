@@ -202,9 +202,10 @@ python skill/scripts/bench_case.py --case <name>
 - 性能：前向、反向各自相对 `torch.compile`（默认 mode）≥1.05×，3 次重跑 CV≤5%。
 - **稳定过线**：加速比擦线（1.05–1.10× 区间）时，单次 PASS 不算达标——须连跑 3 次全 PASS 才算真达标；
   共享/繁忙 GPU 上擦线加速比会在达标线上下抖动，达标应留安全余量（目标 ≥1.10×）而非骑在 1.05 线。
-- **警惕短核假象**：若 baseline 前/反向 <0.15ms 却给高加速比（1.2×+），多半是固定开销虚高——**短核 case（LayerNorm/
-  RMSNorm/softmax 等逐行+规约类）必须先建 bench.env 放大规模（B→32768 级）测真实性能**，别信短核下的高加速比就收工。
-  实测教训：aider 的 RMSNorm 短核下显示 前1.22/反1.43 PASS，放大规模后真实是 前0.99 FAIL/反1.07。
+- **警惕短核假象**：若 baseline 前/反向 <0.15ms 却给高加速比（1.2×+），多半是固定开销虚高。**只要 config 的规模支持 env 覆盖，
+  `run_on_a100.sh` 会自动探测短核并放大规模重测（harness 兜底，无需你建 bench.env）**——所以务必让 config 参数化规模
+  （`os.environ.get("XXX", "默认")`）。可选：短核 case 建 `bench.env` 声明规模更明确。实测：aider 的 RMSNorm 短核下显示 前1.22/反1.43，
+  harness 自动放大后真实 前0.86/反1.00 FAIL——兜底让不建 bench.env 的 agent 也不被短核假象骗。
 - 两者同时满足即达成。
 
 ## 新增一个算法 case

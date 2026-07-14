@@ -40,6 +40,7 @@ AUTO_GPU=0
 SYNC_CLI=0
 STRICT=0                                      # 1=按 VERDICT 决定退出码(PASS=0/其余=1)，供 aider --auto-test 等靠退出码驱动的自主闭环
 ROUND_CAP=0                                  # 0=禁用(Stage B 半自动默认)；>0 启用机械轮次上限(Stage C 全自主兜底)
+AUTO_SCALE=1                                 # 1=默认开：无 size-env/bench.env 时自动探短核并放大重测(harness 兜底，补 agent 不建 bench.env 的弱点)
 REMOTE_REPO="~/nl2cuda-kernel-agent"
 SIZE_ENV=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -55,6 +56,7 @@ while [ $# -gt 0 ]; do
     --remote-repo) REMOTE_REPO="$2"; shift 2 ;;
     --size-env)    SIZE_ENV="$2"; shift 2 ;;
     --round-cap)   ROUND_CAP="$2"; shift 2 ;;
+    --no-auto-scale) AUTO_SCALE=0; shift ;;
     -*)            echo "未知参数: $1" >&2; exit 2 ;;
     *)             CASE="$1"; shift ;;
   esac
@@ -79,6 +81,22 @@ if [ -z "$SIZE_ENV" ]; then
 fi
 # 逗号转空格，供远程 env 使用（K=V,K=V → K=V K=V）
 SIZE_ENV="${SIZE_ENV//,/ }"
+
+# ---- 自动放大兜底：无 size-env/bench.env 时，grep config 发现规模 env 变量，交远程探短核后自动放大 ----
+# 补 aider 弱点：它不主动建 bench.env → 短核 case 会被固定开销虚高骗。harness 侧兜底，宿主无关。
+# 只在"没有任何显式规模指定"时启用；显式 --size-env / bench.env / 内置表命中则不介入。
+SCALE_VAR=""
+AUTO_TARGET=32768   # 探到短核时把规模 env 放大到此值（让核 ≥0.2ms，摊薄固定开销）
+if [ "$AUTO_SCALE" = "1" ] && [ -z "$SIZE_ENV" ]; then
+  # 取 config.py 第一个 os.environ.get("XXX", ...) 的变量名（如 RMS_B / SCAN_B / LN_B）
+  SCALE_VAR="$(grep -oE 'os\.environ\.get\("[A-Za-z_]+"' "$WORKDIR/cases/$CASE/config.py" 2>/dev/null \
+               | head -1 | sed -E 's/.*"([A-Za-z_]+)".*/\1/')"
+  if [ -z "$SCALE_VAR" ]; then
+    echo "[run_on_a100] 提示：无 size-env/bench.env 且 config 未参数化规模，无法自动放大——结果可能是短核虚高。" >&2
+  else
+    echo "[run_on_a100] auto-scale 待命：若探到短核，将用 $SCALE_VAR=$AUTO_TARGET 放大重测。" >&2
+  fi
+fi
 
 # ---- (A) 防作弊前置：framework/ 不得被本地改动 ----
 # 用 numstat -w 忽略纯行尾/空白差异（WSL↔Windows checkout 常见 CRLF 视图差异会误判为脏）；
@@ -133,9 +151,9 @@ for attempt in 1 2 3; do
     echo "[run_on_a100] 传输失败（第 $attempt 次），重试…" >&2; sleep 5; continue
   fi
   # 再跑远程评测：quoted heredoc（本地不展开），本地值经 bash -s 位置参数传入（无需转义 \$）
-  RESULT="$(ssh_a100 "bash -s -- '$CASE' '$GPU' '$SIZE_ENV' '$REMOTE_REPO' '$REMOTE_PAYLOAD'" 2>/dev/null <<'REMOTE'
+  RESULT="$(ssh_a100 "bash -s -- '$CASE' '$GPU' '$SIZE_ENV' '$REMOTE_REPO' '$REMOTE_PAYLOAD' '$SCALE_VAR' '$AUTO_TARGET'" 2>/dev/null <<'REMOTE'
 set -u
-CASE="$1"; GPU="$2"; SIZE_ENV="$3"; REMOTE_REPO="$4"; PAYLOAD="$5"
+CASE="$1"; GPU="$2"; SIZE_ENV="$3"; REMOTE_REPO="$4"; PAYLOAD="$5"; SCALE_VAR="$6"; AUTO_TARGET="$7"
 REPO="$(eval echo "$REMOTE_REPO")"          # 展开 ~
 PAYLOAD="$(eval echo "$PAYLOAD")"
 export PATH="$HOME/miniconda3/bin:/usr/local/cuda/bin:$PATH"
@@ -150,6 +168,20 @@ RUN="CUDA_VISIBLE_DEVICES=$GPU CUDA_ARCHS=80 $SIZE_ENV"
 if env $RUN python skill/scripts/verify_case.py --case "$CASE" > /tmp/nl2_verify.log 2>&1; then
   echo "---VERIFY---"; cat /tmp/nl2_verify.log
   env $RUN python skill/scripts/bench_case.py --case "$CASE" --emit-verdict > /tmp/nl2_bench.log 2>&1 || true
+  # 自动放大兜底：无显式 size-env 且发现了规模变量时，探测 baseline 是否短核（前/反向任一 <0.15ms）；
+  # 若短核则用 SCALE_VAR=AUTO_TARGET 放大重测（verify 不受规模影响，只重跑 bench）。
+  if [ -z "$SIZE_ENV" ] && [ -n "$SCALE_VAR" ]; then
+    BF="$(grep -E '^\s*forward\s*:' /tmp/nl2_bench.log | head -1 | grep -oE '[0-9.]+ ms' | grep -oE '[0-9.]+')"
+    BB="$(grep -E '^\s*backward\s*:' /tmp/nl2_bench.log | head -1 | grep -oE '[0-9.]+ ms' | grep -oE '[0-9.]+')"
+    SHORT=0
+    awk "BEGIN{exit !($BF < 0.15 || $BB < 0.15)}" 2>/dev/null && SHORT=1
+    if [ "$SHORT" = "1" ]; then
+      echo "[auto-scale] 探到短核(baseline fwd=${BF}ms/bwd=${BB}ms<0.15) → 用 $SCALE_VAR=$AUTO_TARGET 放大重测"
+      RUN2="CUDA_VISIBLE_DEVICES=$GPU CUDA_ARCHS=80 $SCALE_VAR=$AUTO_TARGET"
+      rm -rf "$HOME/.cache/torch_extensions"/*/*"$CASE"* 2>/dev/null || true
+      env $RUN2 python skill/scripts/bench_case.py --case "$CASE" --emit-verdict > /tmp/nl2_bench.log 2>&1 || true
+    fi
+  fi
   echo "---BENCH---"; cat /tmp/nl2_bench.log
 else
   echo "---VERIFY---"; cat /tmp/nl2_verify.log
