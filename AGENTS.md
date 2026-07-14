@@ -27,13 +27,17 @@
    - `__init__.py`：组装 `CASE`（7 字段）。
    - `kernels/*.cu`：前向 + 反向 kernel。**反向公式用户不会给——按 SKILL.md 技巧库自主推导**（autograd 对拍校验）。
    - `op.py`：`torch.autograd.Function` 封装为 `candidate(inputs, params)`。
-   - **短核 case 必加 `cases/<name>/bench.env`**（内容一行，如 `SIZE_ENV="RMS_B=32768"`）：若默认规模下核很短
-     （前/反向 <0.2ms，如归一化类默认 B=4096 时前向仅 0.06ms），计时会因固定开销虚高、CV 抖动。`run_on_a100.sh`
-     会自动读该文件放大规模测。config.py 要让规模支持对应 env 覆盖（如 `B=int(os.environ.get("RMS_B","4096"))`）。
+   - **短核 case 必加 `cases/<name>/bench.env`（否则会被短核假象骗）**：若默认规模下核很短（前/反向 <0.2ms，
+     如归一化/逐元素类默认 B=4096 时前向仅 0.06ms），计时**固定开销（kernel launch 等）会把加速比抬得虚高**——
+     短核下看到 1.2× 可能放大到真实规模后只有 0.9×。**凡前向/反向本质是"逐行/逐元素+规约"的算法（LayerNorm/RMSNorm/
+     softmax 等）都属短核，必须建 bench.env**（内容一行 `SIZE_ENV="<你的规模env>=32768"`）+ config.py 让规模支持该 env 覆盖
+     （如 `B=int(os.environ.get("RMS_B","4096"))`）。`run_on_a100.sh` 会自动读它放大规模测真实性能。
 4. **自测（自动，无需用户提）**：跑 `bash skill/scripts/run_on_a100.sh <name> --gpu 7 --strict`
    （首次加 `--sync-cli`）。它在远程 GPU 跑 verify+bench，末行给 `VERDICT=`。按 `skill/AUTONOMOUS_LOOP.md` 的
    VERDICT 决策：`PASS`→交付；`VERIFY_FAIL`→修正确性（不看 bench）；`BENCH_FAIL`→按 `skill/loop.md` 优化未达标侧 kernel；
    `CV_INVALID`→原样重跑。
+   > **警惕短核假象**：若 bench 显示 baseline 前向/反向 <0.15ms 却给出高加速比（如 1.2×+），**别信、别停**——
+   > 那是固定开销虚高。回去建/改 bench.env 放大规模重测，看真实加速比再判达标。
 5. **优化到达标**：未达标则迭代（只改 `cases/<name>/`），直到 `VERDICT=PASS`。
    **擦线（1.05–1.10×）须连跑 3 次全 PASS 才算达标**（见 SKILL.md 达标判据）。
 
