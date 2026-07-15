@@ -23,6 +23,9 @@
    **名字拿不准或可能与已有 case 重名时，先问用户一句**再继续。
 3. **写实现**（严格按 SKILL.md "Case 协议"的 7 字段和骨架）：
    - `reference.py`：PyTorch 金标准，用基础算子表达前向（**禁止落回 `F.*`/SDPA 等高层算子**），autograd 提供反向。
+     **必须向量化，禁止 Python 逐元素/逐行/逐列 `for` 循环**——描述里"单遍/在线扫描/逐列累加"是数学语义不是实现方式，
+     用广播+整体规约（`x.amax(-1,keepdim=True)`、`exp(...).sum(-1)`）等价表达。原因：bench 会对 reference 做 `torch.compile` 作 baseline，
+     Python 循环展开成 O(C) 巨型图会**卡死 bench**（online_softmax 曾逐列 C=1024→编译 44s 挂），且逐元素 eager baseline 畸形慢造成**"弱 baseline 假象"**（加速比虚高不诚实）。reference 里出现 `for` 遍历张量维度几乎一定写错。
    - `config.py`：shape/参数；**短核 case 让规模支持 env 覆盖**（如 `B = int(os.environ.get("LN_B","4096"))`）。
    - `__init__.py`：组装 `CASE`（7 字段）。
    - `kernels/*.cu`：前向 + 反向 kernel。**反向公式用户不会给——按 SKILL.md 技巧库自主推导**（autograd 对拍校验）。

@@ -98,6 +98,7 @@ def make_inputs(seed, dtype, device, requires_grad=False):
 在 `cases/<name>/reference.py` 用**基础算子**（广播、matmul、逐元素、规约）表达前向，autograd 自动提供反向。
 - **红线**：待测路径禁止落回 `F.scaled_dot_product_attention` / `torch.nn.functional` 等高层融合算子。
 - 用自然、直接的写法翻译描述（不要为了让 baseline 变慢而扭曲，也不要用 GEMM 分解等把 baseline 推向 cuBLAS 而变得打不过）。
+- **必须向量化，禁止 Python 逐元素/逐行/逐列 for 循环**：算法描述里的"逐步/单遍/在线扫描/逐列累加"等**串行叙述是数学语义，不是实现方式**——要用张量广播+整体规约（如 `logits.amax(-1,keepdim=True)`、`exp(...).sum(-1)`）等价表达，**不要 `for c in range(C): ...` 逐列迭代**。原因有二：①`framework/bench.py` 会对 reference 做 `torch.compile` 作 baseline，Python 循环会被展开成 O(C) 巨型图，**首次编译几十秒甚至卡死 bench**（online_softmax 曾因逐列循环 C=1024 → torch.compile 编译 44s 卡挂）；②逐元素循环的 eager baseline 畸形慢，会造成**"弱 baseline 假象"**——candidate 跟畸形慢的基线比，加速比虚高但不诚实（类比[短核假象]）。**自检**：reference 里出现 `for` 遍历张量维度，几乎一定写错了，改成向量化算子。
 - 在 `config.py` 固定 shape/参数，在 `__init__.py` 组装 `CASE`（**严格照上面"Case 协议"章节的 7 个必填字段和骨架模板**，别猜；`cases/rbf/` 是完整范例）。
 
 ### 步骤 3：写 CUDA 前向 kernel → 验证
@@ -185,7 +186,11 @@ python skill/scripts/bench_case.py --case <name>
 
 ## 防作弊红线（不可违反）
 
-1. 待测路径禁止落回 `F.scaled_dot_product_attention` / `torch.nn.functional` 等高层算子。
+1. 待测路径禁止落回 `F.scaled_dot_product_attention` / `torch.nn.functional` / `torch.matmul` 等 **torch 高层算子**。
+   **但允许 CUDA 官方底层库**（cuBLAS `cublasSgemm`、CUB `BlockScan/DeviceScan` 等）——它们是 CUDA 生态的底层原语、
+   非 torch 高层封装，与本红线不冲突。判据：candidate 走的是自定义 `.cu`（可在其中调 cuBLAS/CUB + 手写融合/逐元素 kernel），
+   不是回到 PyTorch 的高层张量算子。实测判例：GEMM+bias+gelu 用 `cublasSgemm` 做矩阵乘 + 手写 bias+gelu 融合尾 → 合规
+   （赢 torch.compile 靠融合省中间物化/额外 launch，是正当优势）；scan 用 CUB block scan → 合规。
 2. 禁止修改/绕过 `framework/` 下的验证器、计时器、协议（评测基座只读）。
 3. 禁止降精度换速度（除非算法描述本身指定低精度）。
 4. 交付 `.cu` 须能独立编译、无 torch 高层运行时依赖。

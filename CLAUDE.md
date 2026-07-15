@@ -14,7 +14,7 @@
 
 1. 先读 `skill/SKILL.md`（尤其"Case 协议""CUDA Kernel 实现技巧""防作弊红线""达标判据"）、`skill/DESIGN.md`、`framework/case.py`。`framework/` 只读。
 2. 据算法起简短 case 名，建 `cases/<name>/`，把定义写成 `description.md`。名字拿不准/可能重名先问一句。
-3. 严格按 Case 协议 7 字段写 `reference.py`（基础算子、禁 `F.*` 高层算子）、`config.py`（短核让规模支持 env 覆盖）、`__init__.py`、`kernels/*.cu`（**反向按技巧库自主推导，autograd 对拍**）、`op.py`（`candidate`）。
+3. 严格按 Case 协议 7 字段写 `reference.py`（基础算子、禁 `F.*` 高层算子、**必须向量化禁 Python 逐元素/逐列 `for` 循环**——描述里"单遍/在线扫描"是数学语义，用广播+规约表达；否则 bench 对其 `torch.compile` 会卡死+弱 baseline 假象）、`config.py`（短核让规模支持 env 覆盖）、`__init__.py`、`kernels/*.cu`（**反向按技巧库自主推导，autograd 对拍**）、`op.py`（`candidate`）。
 4. **自测（自动，无需用户提）**：跑 `bash skill/scripts/run_on_a100.sh <name> --gpu 7 --strict`（首次加 `--sync-cli`），据 `VERDICT=`/日志按 `skill/AUTONOMOUS_LOOP.md` 决策。
 5. 未达标按 `skill/loop.md` 优化（只改 `cases/<name>/`）到 `VERDICT=PASS`；擦线（1.05–1.10×）须连跑 3 次全 PASS。
 
