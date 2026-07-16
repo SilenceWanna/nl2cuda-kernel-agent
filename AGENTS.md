@@ -25,7 +25,7 @@
    - `reference.py`：PyTorch 金标准，用基础算子表达前向（**禁止落回 `F.*`/SDPA 等高层算子**），autograd 提供反向。
      **必须向量化，禁止 Python 沿任何张量维度的 `for` 循环（包括时序/序列维度，不只是"逐元素/逐列"）**——描述里"单遍/在线扫描/逐列累加/沿时序递推"是数学语义不是实现方式，
      用广播+整体规约+`torch.cumsum`/`torch.pow(a,arange(T))` 等价表达。原因：bench 会对 reference 做 `torch.compile` 作 baseline，
-     Python 循环展开成 O(N) 巨型图会**卡死 bench**（online_softmax 曾逐列 C=1024→编译 44s 挂；linear_ssm 曾 `for t in range(1024)` → 死锁 fork 进程炸弹），且逐元素 eager baseline 畸形慢造成**"弱 baseline 假象"**（加速比虚高不诚实）。**scan/递推类算法**（如 `h_t=a*h_{t-1}+b*x_t`）**禁止用 `torch.tril(W)+einsum` 的 O(T²) 密集矩阵变体**（伪向量化，把 O(T) 算法恶化到 O(T²)），要用 `torch.cumsum` 类 O(T) 前缀原语（如 `h_t=b·a^t·cumsum(x/a^t)`）。reference 里出现 `for` 遍历任何张量维度、或 `T×T` 中间矩阵，几乎一定写错。
+     Python 循环展开成 O(N) 巨型图会**卡死 bench**（online_softmax 曾逐列 C=1024→编译 44s 挂；linear_ssm 曾 `for t in range(1024)` → 死锁 fork 进程炸弹），且逐元素 eager baseline 畸形慢造成**"弱 baseline 假象"**（加速比虚高不诚实）。**scan/递推类算法**（如 `h_t=a*h_{t-1}+b*x_t`）**禁止用 `torch.tril(W)+einsum` 的 O(T²) 密集矩阵变体**（伪向量化，把 O(T) 算法恶化到 O(T²)），要用 `torch.cumsum` 类 O(T) 前缀原语（如 `h_t=b·a^t·cumsum(x/a^t)`）。**reference 还禁止规模/条件专属分支**（`if x.numel()>=阈值: 快路径 else: 慢路径`）——金标准须始终用同一份最干净向量化，否则 bench 规模命中慢分支会造弱 baseline 假象（welford 曾因 `numel<64M 走 cumsum 慢分支` 刷出前2.71×，走干净分支真实仅0.99×）。reference 里出现 `for` 遍历任何张量维度、`T×T` 中间矩阵、或按 `numel/shape` 切实现分支，几乎一定写错。
    - `config.py`：shape/参数；**短核 case 让规模支持 env 覆盖**（如 `B = int(os.environ.get("LN_B","4096"))`）。
    - `__init__.py`：组装 `CASE`（7 字段）。
    - `kernels/*.cu`：前向 + 反向 kernel。**反向公式用户不会给——按 SKILL.md 技巧库自主推导**（autograd 对拍校验）。
