@@ -115,6 +115,18 @@ if git -C "$WORKDIR" rev-parse --git-dir >/dev/null 2>&1; then
   fi
 fi
 
+# ---- (A3) reference 静态预检（本地，跑 A100 前）：扫 reference/make_inputs 弱 baseline 危险写法 ----
+# 弱 baseline 源头在 reference 写法(for/T²-Toeplitz/规模分支/cumprod 脆弱/挑输入分布/高层算子)。
+# auto-scale 管"规模不够"、本预检管"写法可疑"，正交互补，在传输/编译前就预警(省算力)。
+# 默认只 WARN 打印不拦(有合法例外如变系数递推 T²)；红线(高层算子)命中才在日志显著标红，仍交 verify 定论。
+if [ -f "$SCRIPT_DIR/check_reference.py" ]; then
+  REF_SCAN="$(python "$SCRIPT_DIR/check_reference.py" --case "$CASE" --workdir "$WORKDIR" 2>/dev/null)"
+  if ! echo "$REF_SCAN" | grep -q 'REF_CHECK=CLEAN'; then
+    echo "[run_on_a100] reference 预检发现可疑写法（不拦，供核查——弱 baseline 常源于此）：" >&2
+    echo "$REF_SCAN" | grep -E '^\s*\[(WARN|RED)\]' >&2
+  fi
+fi
+
 # ---- (A2) 机械轮次上限兜底（Stage C 全自主防跑飞）----
 # --round-cap N (N>0) 启用：每次调用对本 case 计数；超过 N 轮直接拒跑并发 ROUND_CAP_EXCEEDED，
 # 即便 agent 失控也能在上下文里拿到硬停信号。计数存 workdir 的 .a100_round_<case>，PASS 时清零（见末尾）。
