@@ -58,9 +58,10 @@ def scan_reference(src):
     # 1. 红线§1：高层融合算子落回
     for pat, name in [
         (r"scaled_dot_product_attention", "F.scaled_dot_product_attention"),
-        (r"F\.(softmax|layer_norm|conv1d|conv2d|linear|multi_head|cross_entropy|scaled)", "F.* 高层算子"),
+        (r"F\.(softmax|layer_norm|group_norm|batch_norm|conv1d|conv2d|conv3d|linear|multi_head|cross_entropy|scaled|embedding)", "F.* 高层算子"),
+        (r"F\.(max_pool|avg_pool|adaptive_max_pool|adaptive_avg_pool|lp_pool)", "F.*_pool 池化层算子"),
         (r"nn\.functional\.", "nn.functional.*"),
-        (r"nn\.(MultiheadAttention|Conv1d|Conv2d|Linear|LayerNorm)", "nn.* 高层模块"),
+        (r"nn\.(MultiheadAttention|Conv1d|Conv2d|Conv3d|Linear|LayerNorm|GroupNorm|BatchNorm|MaxPool|AvgPool|Embedding)", "nn.* 高层模块"),
     ]:
         if re.search(pat, code):
             findings.append(("RED", "hi-level-op", f"疑似落回高层算子（{name}）——红线§1 禁止；reference 须用基础算子表达"))
