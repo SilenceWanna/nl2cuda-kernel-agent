@@ -82,11 +82,16 @@ fi
 # 逗号转空格，供远程 env 使用（K=V,K=V → K=V K=V）
 SIZE_ENV="${SIZE_ENV//,/ }"
 
-# ---- 自动放大兜底：无 size-env/bench.env 时，grep config 发现规模 env 变量，交远程探短核后自动放大 ----
+# ---- 自动放大兜底：无 size-env/bench.env 时，grep config 发现规模 env 变量，交远程探短核后自适应放大 ----
 # 补 aider 弱点：它不主动建 bench.env → 短核 case 会被固定开销虚高骗。harness 侧兜底，宿主无关。
 # 只在"没有任何显式规模指定"时启用；显式 --size-env / bench.env / 内置表命中则不介入。
+# 自适应放大（2026-07-17，替代旧固定 32768）：探到短核后迭代放大规模（×4/轮），直到 baseline 前反向
+# 均进入"计算主导区"（≥AUTO_TARGET_MS）或触规模/轮次上限——避免固定值对不同算法复杂度不适配
+# （旧固定 32768 曾坑：attention O(T²) 过大 283ms、scatter O(N) 仍短核 CV_INVALID、conv1d 阈值边界）。
 SCALE_VAR=""
-AUTO_TARGET=32768   # 探到短核时把规模 env 放大到此值（让核 ≥0.2ms，摊薄固定开销）
+AUTO_START=8192      # 放大起点规模
+AUTO_MAX=4194304     # 规模上限（防显存爆炸/失控，4M）
+AUTO_TARGET_MS=1.0   # 目标：baseline 前反向均 ≥此耗时(ms) 才算进入计算主导区（CV 稳、摊薄固定开销）；未达则放大
 if [ "$AUTO_SCALE" = "1" ] && [ -z "$SIZE_ENV" ]; then
   # 取 config.py 第一个 os.environ.get("XXX", ...) 的变量名（如 RMS_B / SCAN_B / LN_B）
   SCALE_VAR="$(grep -oE 'os\.environ\.get\("[A-Za-z_]+"' "$WORKDIR/cases/$CASE/config.py" 2>/dev/null \
@@ -94,7 +99,7 @@ if [ "$AUTO_SCALE" = "1" ] && [ -z "$SIZE_ENV" ]; then
   if [ -z "$SCALE_VAR" ]; then
     echo "[run_on_a100] 提示：无 size-env/bench.env 且 config 未参数化规模，无法自动放大——结果可能是短核虚高。" >&2
   else
-    echo "[run_on_a100] auto-scale 待命：若探到短核，将用 $SCALE_VAR=$AUTO_TARGET 放大重测。" >&2
+    echo "[run_on_a100] auto-scale 待命：若探到短核，将从 $SCALE_VAR=$AUTO_START 起自适应放大(×4/轮)到 baseline≥${AUTO_TARGET_MS}ms 或上限 $AUTO_MAX。" >&2
   fi
 fi
 
@@ -151,9 +156,9 @@ for attempt in 1 2 3; do
     echo "[run_on_a100] 传输失败（第 $attempt 次），重试…" >&2; sleep 5; continue
   fi
   # 再跑远程评测：quoted heredoc（本地不展开），本地值经 bash -s 位置参数传入（无需转义 \$）
-  RESULT="$(ssh_a100 "bash -s -- '$CASE' '$GPU' '$SIZE_ENV' '$REMOTE_REPO' '$REMOTE_PAYLOAD' '$SCALE_VAR' '$AUTO_TARGET'" 2>/dev/null <<'REMOTE'
+  RESULT="$(ssh_a100 "bash -s -- '$CASE' '$GPU' '$SIZE_ENV' '$REMOTE_REPO' '$REMOTE_PAYLOAD' '$SCALE_VAR' '$AUTO_START' '$AUTO_MAX' '$AUTO_TARGET_MS'" 2>/dev/null <<'REMOTE'
 set -u
-CASE="$1"; GPU="$2"; SIZE_ENV="$3"; REMOTE_REPO="$4"; PAYLOAD="$5"; SCALE_VAR="$6"; AUTO_TARGET="$7"
+CASE="$1"; GPU="$2"; SIZE_ENV="$3"; REMOTE_REPO="$4"; PAYLOAD="$5"; SCALE_VAR="$6"; AUTO_START="$7"; AUTO_MAX="$8"; AUTO_TARGET_MS="$9"
 REPO="$(eval echo "$REMOTE_REPO")"          # 展开 ~
 PAYLOAD="$(eval echo "$PAYLOAD")"
 export PATH="$HOME/miniconda3/bin:/usr/local/cuda/bin:$PATH"
@@ -168,18 +173,33 @@ RUN="CUDA_VISIBLE_DEVICES=$GPU CUDA_ARCHS=80 $SIZE_ENV"
 if env $RUN python skill/scripts/verify_case.py --case "$CASE" > /tmp/nl2_verify.log 2>&1; then
   echo "---VERIFY---"; cat /tmp/nl2_verify.log
   env $RUN python skill/scripts/bench_case.py --case "$CASE" --emit-verdict > /tmp/nl2_bench.log 2>&1 || true
-  # 自动放大兜底：无显式 size-env 且发现了规模变量时，探测 baseline 是否短核（前/反向任一 <0.15ms）；
-  # 若短核则用 SCALE_VAR=AUTO_TARGET 放大重测（verify 不受规模影响，只重跑 bench）。
+  # 自适应放大兜底：无显式 size-env 且发现规模变量时，只要 baseline 未进入"计算主导区"（前/反向任一
+  # <AUTO_TARGET_MS）就迭代放大规模（从 AUTO_START 起 ×4/轮），直到前反向均 ≥AUTO_TARGET_MS 或触规模上限。
+  # 用统一的"计算主导区"判据（而非旧 0.15ms 中间阈值——会踩 conv1d/scatter 险过边界的坑）。verify 不受规模影响。
+  parse_ms() { grep -E "^\s*$1\s*:" /tmp/nl2_bench.log | head -1 | grep -oE '[0-9.]+ ms' | grep -oE '[0-9.]+'; }
   if [ -z "$SIZE_ENV" ] && [ -n "$SCALE_VAR" ]; then
-    BF="$(grep -E '^\s*forward\s*:' /tmp/nl2_bench.log | head -1 | grep -oE '[0-9.]+ ms' | grep -oE '[0-9.]+')"
-    BB="$(grep -E '^\s*backward\s*:' /tmp/nl2_bench.log | head -1 | grep -oE '[0-9.]+ ms' | grep -oE '[0-9.]+')"
-    SHORT=0
-    awk "BEGIN{exit !($BF < 0.15 || $BB < 0.15)}" 2>/dev/null && SHORT=1
-    if [ "$SHORT" = "1" ]; then
-      echo "[auto-scale] 探到短核(baseline fwd=${BF}ms/bwd=${BB}ms<0.15) → 用 $SCALE_VAR=$AUTO_TARGET 放大重测"
-      RUN2="CUDA_VISIBLE_DEVICES=$GPU CUDA_ARCHS=80 $SCALE_VAR=$AUTO_TARGET"
-      rm -rf "$HOME/.cache/torch_extensions"/*/*"$CASE"* 2>/dev/null || true
-      env $RUN2 python skill/scripts/bench_case.py --case "$CASE" --emit-verdict > /tmp/nl2_bench.log 2>&1 || true
+    BF="$(parse_ms forward)"; BB="$(parse_ms backward)"
+    if awk "BEGIN{exit !(($BF+0) < $AUTO_TARGET_MS || ($BB+0) < $AUTO_TARGET_MS)}" 2>/dev/null; then
+      echo "[auto-scale] baseline fwd=${BF}ms/bwd=${BB}ms 未达计算主导区(≥${AUTO_TARGET_MS}ms) → 自适应放大"
+      SCALE="$AUTO_START"; ITER=0
+      while [ "$ITER" -lt 6 ]; do
+        ITER=$((ITER+1))
+        RUN2="CUDA_VISIBLE_DEVICES=$GPU CUDA_ARCHS=80 $SCALE_VAR=$SCALE"
+        rm -rf "$HOME/.cache/torch_extensions"/*/*"$CASE"* 2>/dev/null || true
+        env $RUN2 python skill/scripts/bench_case.py --case "$CASE" --emit-verdict > /tmp/nl2_bench.log 2>&1 || true
+        BF="$(parse_ms forward)"; BB="$(parse_ms backward)"
+        echo "[auto-scale] 第${ITER}轮 $SCALE_VAR=$SCALE → baseline fwd=${BF}ms/bwd=${BB}ms"
+        # 计算主导区：前反向均 ≥目标耗时 → 停（结果可信）
+        if awk "BEGIN{exit !(($BF+0) >= $AUTO_TARGET_MS && ($BB+0) >= $AUTO_TARGET_MS)}" 2>/dev/null; then
+          echo "[auto-scale] 已进入计算主导区(前反向均≥${AUTO_TARGET_MS}ms)，用此规模结果"; break
+        fi
+        # 触规模上限 → 停（已尽力放大，用当前结果）
+        NEXT=$((SCALE*4))
+        if [ "$NEXT" -gt "$AUTO_MAX" ]; then
+          echo "[auto-scale] 触规模上限 $AUTO_MAX，停止放大，用当前规模结果"; break
+        fi
+        SCALE="$NEXT"
+      done
     fi
   fi
   echo "---BENCH---"; cat /tmp/nl2_bench.log
