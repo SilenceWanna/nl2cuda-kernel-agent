@@ -95,6 +95,14 @@ def scan_reference(src):
                          "reference 用 cumprod 且含除法——变系数递推的 cumprod/cumsum(x/cumprod) 形式数值脆弱"
                          "(系数连乘下溢→除法 NaN)且反向图畸形；应改 log 空间 O(T^2) 下三角(exp(L_t-L_j))"))
 
+    # 6. 用 sort 全排序取前 k（应用最优原语 topk）：torch.sort(...) 后随即切片 [:k]/[..., :k]
+    #    O(D·logD) 全排序只为取前 k 个 → baseline 畸形慢(尤其排序反向)，是弱 baseline
+    #    （用更慢通用算子替代最优原语当 baseline）。正解：torch.topk（O(D) radix select）。
+    if re.search(r"\b(torch\.)?sort\b", code) and re.search(r":\s*(params\[|k\b|self\.k|[0-9]+\s*\])", code):
+        findings.append(("WARN", "sort-for-topk",
+                         "reference 疑似用 sort 全排序后切片取前 k(如 sort(...)[:, :k])——O(D·logD) 全排序只为取 top-k "
+                         "是弱 baseline(比最优 topk 慢，排序反向尤慢，加速比虚高)；应用 torch.topk(O(D) radix select)作诚实基线"))
+
     return findings
 
 
