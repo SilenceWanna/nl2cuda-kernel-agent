@@ -127,19 +127,21 @@ if [ -f "$SCRIPT_DIR/check_reference.py" ]; then
   fi
 fi
 
-# ---- (A2) 机械轮次上限兜底（Stage C 全自主防跑飞）----
-# --round-cap N (N>0) 启用：每次调用对本 case 计数；超过 N 轮直接拒跑并发 ROUND_CAP_EXCEEDED，
-# 即便 agent 失控也能在上下文里拿到硬停信号。计数存 workdir 的 .a100_round_<case>，PASS 时清零（见末尾）。
+# ---- (A2) 轮次计数 + 机械上限兜底 ----
+# **总是计数**每次自测调用（存 workdir 的 .a100_round_<case>），用于客观统计"到达标跑了几轮"——
+# 不依赖 --round-cap（后者只额外管"超 N 轮拒跑"）。PASS 时把最终轮次存档到 .round_final_<case> 再清零（见末尾）。
 ROUND_FILE="$WORKDIR/.a100_round_$CASE"
+ROUND_N=0; [ -f "$ROUND_FILE" ] && ROUND_N="$(cat "$ROUND_FILE" 2>/dev/null || echo 0)"
+ROUND_N=$((ROUND_N + 1))
+echo "$ROUND_N" > "$ROUND_FILE"
 if [ "$ROUND_CAP" -gt 0 ] 2>/dev/null; then
-  ROUND_N=0; [ -f "$ROUND_FILE" ] && ROUND_N="$(cat "$ROUND_FILE" 2>/dev/null || echo 0)"
-  ROUND_N=$((ROUND_N + 1))
-  echo "$ROUND_N" > "$ROUND_FILE"
   if [ "$ROUND_N" -gt "$ROUND_CAP" ]; then
     echo "已达轮次上限 $ROUND_CAP（本轮第 $ROUND_N 次）——停止自主 loop，请人工介入。" >&2
     emit ROUND_CAP_EXCEEDED; exit 1
   fi
   echo "[run_on_a100] round $ROUND_N/$ROUND_CAP" >&2
+else
+  echo "[run_on_a100] round $ROUND_N（本 case 累计自测次数）" >&2
 fi
 
 # ---- (B) 打包 payload（只含 cases/<case>；--sync-cli 时附带两个 CLI）----
@@ -234,8 +236,10 @@ fi
 echo "$RESULT"
 FINAL_VERDICT="$(echo "$RESULT" | grep '^VERDICT=' | tail -1)"
 echo "$FINAL_VERDICT"
-# PASS 即 loop 完成，清零轮次计数（下次同 case 重新计）
-if [ "$ROUND_CAP" -gt 0 ] 2>/dev/null && echo "$FINAL_VERDICT" | grep -q '^VERDICT=PASS'; then
+# PASS 即 loop 完成：把"到达标的总轮次"存档到 .round_final_<case>（客观计数，供统计各宿主用了几轮），再清零计数
+if echo "$FINAL_VERDICT" | grep -q '^VERDICT=PASS'; then
+  echo "$ROUND_N" > "$WORKDIR/.round_final_$CASE" 2>/dev/null || true
+  echo "[run_on_a100] 达标！到达标累计自测 $ROUND_N 轮（已存档 .round_final_$CASE）" >&2
   rm -f "$ROUND_FILE" 2>/dev/null || true
 fi
 # --strict：按 VERDICT 返回退出码（PASS=0，其余=1），供 aider --auto-test 等靠退出码驱动的自主闭环；

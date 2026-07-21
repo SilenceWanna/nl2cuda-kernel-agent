@@ -46,6 +46,7 @@ tmp/
 
 # 阶段6 自主loop 本地轮次计数(不入库)
 .a100_round_*
+.round_final_*
 
 # aider：忽略机器相关/会话状态，但保留通用的 .aider.conf.yml
 .aider.model.settings.yml
