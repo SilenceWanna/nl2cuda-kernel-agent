@@ -169,6 +169,16 @@ python skill/scripts/bench_case.py --case <name>
 | 规约（sum/mean/max）占大头 | 规约低效 | warp shuffle 规约、两级归约、**列规约二维分块**(C) |
 | 朴素参考物化 [N,M,D] 等大张量 | 带宽/内存 | 融合不物化 (F) |
 | 算法是**累积/扫描依赖**（前缀和、cumsum、cumprod、扫描类）| 串行依赖 | 用成熟**并行扫描原语**（CUB `BlockScan`/`DeviceScan`，或 Hillis-Steele/Blelloch）；反向是**反向扫描**（`dx[j]=Σ_{i≥j} dy[i]`）。实测 scan 用 CUB block scan 前3.4×/反4.1× 大幅达标 |
+| 算法含**矩阵乘**（GEMM、attention 的 Q·Kᵀ/P·V）| 计算密集 | **cuBLAS `cublasSgemm` 做矩阵乘 + 手写融合尾**（bias/gelu/softmax）；赢在融合省中间物化。实测 GEMM+bias+gelu 前1.19/反1.16、attention 前1.3×（cuBLAS batched + 手写 causal softmax）。⚠️cuBLAS 默认 TF32 须 `cublasSetMathMode(CUBLAS_DEFAULT_MATH)` 关掉守 fp32 |
+| **变系数递推**（系数输入依赖，如门控 SSM `h_t=z_t·h_{t-1}+…`，z_t 依赖 x_t）| 串行+无稳定O(N) | reference 用 log 空间 O(T²) 下三角（见步骤2例外）；**candidate 手写 O(T) 递推 kernel** → 对 O(T²) baseline 天然大幅赢（gated_ssm 前7.8/反13.8，是 CUDA 能做稳定 O(T) 而 PyTorch 做不到的真实价值）|
+| **数据依赖写入**（scatter/segment 聚合，多源写同一目标）| atomic 竞争 | atomicAdd + **选低冲突规模**（段数 S 大→每段源少）+ float4 gather 反向。实测 scatter_add S=32768(低冲突) 前2.19；高冲突 S=4096 只 1.02× → 规模/冲突度选择本身是关键决策 |
+| **数据依赖控制流**（top-k、argmax 选择）| 非规则 | 手写 warp 两阶段选择（非全排序）；reference 可用 `torch.topk` 原语但 **candidate 必须手写**；反向稀疏散回被选位置。⚠️别用 `torch.sort()[:,:k]` 全排序 O(DlogD) 当 baseline（弱 baseline 变种D）|
+| **间接寻址/非规则访存**（CSR SpMV、gather-heavy）| 访存不规则 | 手写融合 CSR kernel（gather+乘加一趟，省 index_select+scatter_add 的中间物化）；或 cuSPARSE（但通用路径 descriptor 固定开销大，反向常输）。实测 spmv 手写前5.97/反2.48 |
+
+> **识别本征边界——何时该停（16 形态实测的元经验，避免在打不赢的算子上空转轮次）**：
+> - **带宽墙区（纯访存低算术强度算子的前向）**：如 2×2 maxpool 前向（读4写1）、逐元素归一化前向——`torch.compile` 融合已到**显存带宽上限**，candidate 无论怎么写都难超 5%。**判据**：profile 显示 kernel 已达带宽上限、candidate 与 baseline 访存量相同且都接近峰值带宽 → 认清是**算法本征无前向优化空间**（非 skill/agent 失败），别再烧轮次。maxpool 三宿主前向一致过不了（1.03/0.998/1.02）即铁证。**反向常仍可赢**（有 argmax 散回等可优化结构）。
+> - **归一化/reduce 家族前向的擦线区**：LayerNorm/RMSNorm/l2norm_scale/softmax 前向 reduce 密集，`torch.compile` 已近最优——float4+寄存器缓存能把前向从 ~0.9× 拉到 1.0~1.1× 擦线，但**优化空间小、擦线为常态**（擦线须 3 连稳过，见达标判据）。反向有 Jacobian/列规约可优化，通常能赢更多。
+> - **区分"本征边界"与"没优化够"**：前者三宿主一致卡同一点（如 maxpool 前向），后者是同 case 有宿主赢有宿主输（如 attention/scatter/temperature_softmax——codex 赢 gptme/aider 挂，说明有空间只是没抠到，属 kernel 实现力）。
 
 > **实测印证（LayerNorm 反向，曾被误判为"reduce 密集打不过 torch.compile 的天花板"）**：按上表诊断后三招组合即稳过 5%——
 > ①反向**缓存 mean/rstd**（前向输出、反向读，消除朴素 O(B·D²) 重算）反向 ~1.0×→1.11×；②dgamma/dbeta **二维分块列规约**；
