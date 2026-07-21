@@ -22,7 +22,38 @@
 
 **✅ 达标结果（A100-SXM4-40GB, sm_80）**：前向 **1.10×**、反向 **1.17×**，CV<1.5%，前反向 5 种子正确性全 PASS。全程 fp32、无 fast-math、无高层算子落回。可独立编译的纯 CUDA 交付版见 [`cases/rbf/delivery/`](cases/rbf/delivery/)（`make test` 一键独立编译+自测，不依赖 PyTorch）。
 
-## 目录结构
+## 16 形态光谱（v1）
+
+RBF 之后又扩了 15 个形态，用**纯自然语言输入**在三宿主（aider / gptme / codex）上逐一验证 skill 的通用性与边界。加速比列 codex 版（诚实 baseline 下的独立复验值，代表 skill 能达到的水平）：
+
+| 形态 | 维度 | codex 前/反 | 光谱区间 |
+|------|------|------|------|
+| rbf | 距离/广播 | 1.10 / 1.17 | 稳赢 |
+| layernorm | 归约 | 1.09 / 1.11 | 擦线 |
+| softmax_ce | 归约 | 达标 | 擦线 |
+| scan | 前缀扫描(CUB) | 3.4 / 4.1 | 稳赢 |
+| gemm_bias_gelu | 矩阵乘+融合(cuBLAS) | 1.19 / 1.16 | 稳赢 |
+| online_softmax | 单遍在线归约 | ~1.10 / 2.95 | 稳赢 |
+| rope | 位置编码/elementwise | 2.54 / 1.18 | 稳赢 |
+| linear_ssm | 固定系数递推→cumsum | 3.9 / 4.6 | 稳赢 |
+| welford | 单遍统计→两遍归约 | 1.097 / 1.27 | 擦线 |
+| causal_attn | attention 融合链 | 1.26~1.37 / 1.16~1.40 | 宿主分层(仅codex) |
+| conv1d | 1D 因果卷积 | 4.78 / 1.86 | 稳赢 |
+| gated_ssm | 变系数递推→O(T²)下三角 | 7.80 / 13.78 | 稳赢 |
+| scatter_add | 数据依赖写+atomic | 2.19 / 1.14~1.22 | 宿主分层 |
+| topk | 数据依赖控制流+稀疏反向 | 1.35 / 1.33 | 宿主分层 |
+| maxpool | 2D 空间+argmax 稀疏反向 | 1.03(带宽墙) / 4.58 | 带宽墙(前向) |
+| spmv | CSR 间接寻址/非规则访存 | 5.97 / 2.48 | 稳赢 |
+
+**四光谱区间**：**稳赢区**（距离/scan/卷积/SSM/间接寻址——手写融合空间大）· **擦线区**（归一化/reduce 密集前向——torch.compile 已近最优，1.05~1.10 抖动）· **宿主分层区**（融合密集如 attention/scatter/topk——kernel 实现力或基线诚实度决定成败，常仅最强宿主 codex 拿下）· **带宽墙区**（纯访存低算术强度如 maxpool 前向——三宿主一致过不了，算法本征无优化空间，非 skill/agent 失败）。
+
+**核心结论**：
+- **三维独立**：skill 质量 / 模型能力 / 宿主架构自主性互不相同，测试须三维分离归因（同一 case codex 稳过、aider/gptme 可能因架构或能力栽）。
+- **弱 baseline 5 变种**（reference 不诚实致加速比虚高）：① Python for 循环 ② O(N²) Toeplitz 伪向量化 ③ 规模专属慢分支 ④ cumprod/cumsum 数值脆弱+反向畸形 ⑤ 用更慢通用算子(sort)替代最优原语(topk)。均由 [`skill/scripts/check_reference.py`](skill/scripts/check_reference.py) 静态预检自动预警。
+- **评测鲁棒性加固**：`run_on_a100.sh --auto-scale` 自适应放大到"计算主导区"（补短核假象）+ `check_reference.py` 静态扫危险写法（补弱 baseline）+ 防作弊红线 §1-5 + 擦线 3 连稳定判据。
+- **红线准则**：torch 高层算子（`F.*`/`nn.*`/`matmul`/`sparse.mm`/SDPA）禁；CUDA 官方底层库（cuBLAS/CUB/cuSPARSE）允许；通用张量原语（`topk`/`sort`/`cumsum`/`scatter_add`）reference 里允许但 candidate 须手写 `.cu`。
+
+
 
 两层架构：**通用框架**（算法无关）+ **算法 case**（每算法一份，可替换）。RBF 是第一个 case，后续加新算法只需新增 `cases/<name>/`。
 
@@ -34,7 +65,7 @@
 | `notebooks/` | Colab 驱动 notebook（clone/pull + 装依赖 + 运行入口） |
 | `scripts/` | 通用脚本（如 `probe_env.py` 环境探测） |
 
-已验证的 case：**rbf**（成对距离/RBF 核，验收用例）、**layernorm**（层归一化，验证通用性——单输入+参数张量+标量、3 个待求梯度，framework 零改动即支持）。
+已验证的 case（**16 形态**，覆盖归约/矩阵乘/scan/卷积/位置编码/数据依赖/间接寻址等维度，framework 零改动即支持每一个）：`rbf` · `layernorm` · `softmax_ce` · `scan` · `gemm_bias_gelu` · `online_softmax` · `rope` · `linear_ssm` · `welford` · `causal_attn` · `conv1d` · `gated_ssm` · `scatter_add` · `topk` · `maxpool` · `spmv`。三宿主（aider/gptme/codex）逐形态对照与结论见 [`skill/AGENT_TEST_MATRIX.md`](skill/AGENT_TEST_MATRIX.md)。
 
 ## 挂到宿主 agent（通用性）
 
