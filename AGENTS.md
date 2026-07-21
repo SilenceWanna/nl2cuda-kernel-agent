@@ -47,7 +47,7 @@
 
 ## 防作弊红线（不可违反，详见 SKILL.md）
 
-1. 待测路径禁止落回 `F.scaled_dot_product_attention` / `torch.nn.functional` 等高层算子。
+1. 待测路径禁止落回 `F.scaled_dot_product_attention` / `torch.nn.functional` / `torch.matmul` / `torch.sparse.mm` 等 torch 高层算子。**但允许 CUDA 官方底层库**（cuBLAS/CUB/cuSPARSE——candidate 在自定义 `.cu` 里调它们+手写融合 kernel 合规，非回到 torch 高层）。**通用张量原语**（`torch.topk`/`sort`/`cumsum`/`scatter_add`/`index_select`）**reference 里允许**（基础操作非层算子），但 candidate 仍须手写 `.cu` 不得直接调糊弄；**神经网络层算子**（`F.*`/`nn.*`：max_pool/layer_norm/conv/sdpa/embedding）reference 也禁。
 2. `framework/` 只读——禁止修改/绕过验证器、计时器、协议。
 3. 禁止降精度换速度（保持 fp32、不用 fast-math）。
 4. 交付 `.cu` 须能独立编译、无 torch 高层运行时依赖。

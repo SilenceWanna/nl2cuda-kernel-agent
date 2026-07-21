@@ -191,11 +191,13 @@ python skill/scripts/bench_case.py --case <name>
 
 ## 防作弊红线（不可违反）
 
-1. 待测路径禁止落回 `F.scaled_dot_product_attention` / `torch.nn.functional` / `torch.matmul` 等 **torch 高层算子**。
-   **但允许 CUDA 官方底层库**（cuBLAS `cublasSgemm`、CUB `BlockScan/DeviceScan` 等）——它们是 CUDA 生态的底层原语、
-   非 torch 高层封装，与本红线不冲突。判据：candidate 走的是自定义 `.cu`（可在其中调 cuBLAS/CUB + 手写融合/逐元素 kernel），
+1. 待测路径禁止落回 `F.scaled_dot_product_attention` / `torch.nn.functional` / `torch.matmul` / `torch.sparse.mm` 等 **torch 高层算子**。
+   **但允许 CUDA 官方底层库**（cuBLAS `cublasSgemm`、CUB `BlockScan/DeviceScan`、cuSPARSE 等）——它们是 CUDA 生态的底层原语、
+   非 torch 高层封装，与本红线不冲突。判据：candidate 走的是自定义 `.cu`（可在其中调 cuBLAS/CUB/cuSPARSE + 手写融合/逐元素 kernel），
    不是回到 PyTorch 的高层张量算子。实测判例：GEMM+bias+gelu 用 `cublasSgemm` 做矩阵乘 + 手写 bias+gelu 融合尾 → 合规
-   （赢 torch.compile 靠融合省中间物化/额外 launch，是正当优势）；scan 用 CUB block scan → 合规。
+   （赢 torch.compile 靠融合省中间物化/额外 launch，是正当优势）；scan 用 CUB block scan → 合规；SpMV 用 cuSPARSE 或手写 CSR kernel → 合规
+   （注意 cuSPARSE 通用路径有 descriptor/workspace 固定开销，反向常因此打不过 torch.compile 的融合 scatter——手写融合 kernel 通常更优）。
+   **通用张量原语**（`torch.topk`/`torch.sort`/`torch.cumsum`/`torch.scatter_add`/`torch.index_select` 等）**在 reference 里允许**（它们是基础操作、非神经网络高层层算子），但 candidate 仍须手写 `.cu` 不得直接调这些 torch 原语糊弄；**神经网络层算子**（`F.*`/`nn.*`：max_pool/layer_norm/conv/sdpa/embedding 等）**reference 也禁**。
 2. 禁止修改/绕过 `framework/` 下的验证器、计时器、协议（评测基座只读）。
 3. 禁止降精度换速度（除非算法描述本身指定低精度）。
 4. 交付 `.cu` 须能独立编译、无 torch 高层运行时依赖。
