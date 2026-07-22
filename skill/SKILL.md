@@ -178,7 +178,10 @@ python skill/scripts/bench_case.py --case <name>
 
 > **识别本征边界——何时该停（16 形态实测的元经验，避免在打不赢的算子上空转轮次）**：
 > - **带宽墙区（纯访存低算术强度算子的前向）**：如 2×2 maxpool 前向（读4写1）、逐元素归一化前向——`torch.compile` 融合已到**显存带宽上限**，candidate 无论怎么写都难超 5%。**判据**：profile 显示 kernel 已达带宽上限、candidate 与 baseline 访存量相同且都接近峰值带宽 → 认清是**算法本征无前向优化空间**（非 skill/agent 失败），别再烧轮次。maxpool 三宿主前向一致过不了（1.03/0.998/1.02）即铁证。**反向常仍可赢**（有 argmax 散回等可优化结构）。
-> - **归一化/reduce 家族前向的擦线区**：LayerNorm/RMSNorm/l2norm_scale/softmax 前向 reduce 密集，`torch.compile` 已近最优——float4+寄存器缓存能把前向从 ~0.9× 拉到 1.0~1.1× 擦线，但**优化空间小、擦线为常态**（擦线须 3 连稳过，见达标判据）。反向有 Jacobian/列规约可优化，通常能赢更多。
+> - **归一化/reduce 家族前向——擦线 vs 稳赢由 reduce 规模决定（GroupNorm 实测颠覆"归一化前向必擦线"）**：
+>   - **小 reduce（整行/单行，规约元素 ~1K）→ 擦线区**：LayerNorm/RMSNorm(D=1024)/l2norm_scale/softmax 前向，每个输出的规约量小、算术强度低，`torch.compile` 已近最优——float4+寄存器缓存能把前向从 ~0.9× 拉到 1.0~1.1× 擦线，优化空间小、擦线为常态（须 3 连稳过）。
+>   - **大分组 reduce（规约元素 ~万级）→ 稳赢区**：GroupNorm(组内 C/G×H×W≈1.2万~4万元素)前向，规约量大、算术强度足够高，float4 一 block 一组融合 mean/var 两遍统计+仿射，**跨规模稳赢 1.28~1.40×**（codex 三规模 384/768/2048 稳定）。**判据**：看单个输出的规约元素数——~1K 擦线、~万级可真赢。别因"是归一化"就预判擦线。
+>   - 反向都有 Jacobian/列规约可优化，通常能赢更多（GroupNorm 反向 1.17~1.33×）。
 > - **区分"本征边界"与"没优化够"**：前者三宿主一致卡同一点（如 maxpool 前向），后者是同 case 有宿主赢有宿主输（如 attention/scatter/temperature_softmax——codex 赢 gptme/aider 挂，说明有空间只是没抠到，属 kernel 实现力）。
 
 > **实测印证（LayerNorm 反向，曾被误判为"reduce 密集打不过 torch.compile 的天花板"）**：按上表诊断后三招组合即稳过 5%——
@@ -250,6 +253,7 @@ python skill/scripts/bench_case.py --case <name>
   `run_on_a100.sh` 会自动探测短核并放大规模重测（harness 兜底，无需你建 bench.env）**——所以务必让 config 参数化规模
   （`os.environ.get("XXX", "默认")`）。可选：短核 case 建 `bench.env` 声明规模更明确。实测：aider 的 RMSNorm 短核下显示 前1.22/反1.43，
   harness 自动放大后真实 前0.86/反1.00 FAIL——兜底让不建 bench.env 的 agent 也不被短核假象骗。
+- **规模挑选（短核假象的宿主自选变种，禁）**：诚实做法是**固定一个计算主导区规模**（baseline ≥1ms）把 kernel 优化到达标，**禁止从多个规模里挑一个恰好擦线能过的短核规模**（让固定开销撑高加速比）凑 PASS。**判据：加速比强规模依赖**——同一 kernel 换 2×/4× 规模，若擦线侧从 PASS 掉破 1.05（如 GroupNorm gptme：GN_N=384 前1.07 PASS，768/1536 前1.048/1.035 FAIL），说明前向优势来自固定开销摊薄而非 kernel 真更快，是**规模挑选**。`run_on_a100.sh` 已自动检测：擦线 PASS+短核时自动 ×2/×4 复测，掉破 1.05 判 `VERDICT=PASS_SCALE_SUSPECT`（strict 下算未达标，逼你优化 kernel 本体而非挑规模）。**对策**：选规模让 baseline 进计算主导区（≥1ms）再优化；bench.env 声明的规模要经得起放大交叉验证。
 - 两者同时满足即达成。
 
 ## 新增一个算法 case
