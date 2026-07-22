@@ -27,6 +27,7 @@
 
 1. **提高 occupancy（常最先做）**：朴素版若"一线程一行/一输出"，线程数不足喂满 SM。降 block 到 256 线程、每线程算多个输出（thread coarsening），占用率常从 ~50% 提到满。—— 前向优化实测：这一招把 RBF 前向 4.5→2.3ms。
 2. **前向缓存复用**：反向若重算了前向中间量（dist/K、softmax、mean/std），改为 `ctx.save_for_backward` 存、反向读。—— 实测：RBF 反向靠此从 21.6ms→2.6ms；**LayerNorm 反向靠缓存 mean/rstd 消除朴素 O(B·D²) 重算，从 ~1.0×→1.11×（决定性一招，reduce 密集类也能借此翻盘）**。
+2b. **反向多输出融合到一遍访存**：反向若有多个梯度各用独立 kernel、各自整遍重读同一输入（如 dX 一 kernel + dg 一 kernel 各扫一遍 X/G），**融合到一个 kernel、输入只读一遍**：一 block 管一段行 chunk，读 X/G 一遍同时算 dX 写出 + **shared 私有累积**该 chunk 对跨行梯度（dg）的贡献、chunk 末**一次性 atomicAdd**（atomic 次数=行块数≪N）。—— 实测 l2norm_scale 反向 0.84→1.60×（省 dg 的整遍重读是关键）。⚠️**别用 per-element global atomicAdd 融合**（N 行抢同地址，实测 0.85→0.26× 翻车，见下方翻车教训）。
 3. **算子融合 / 避免物化**：多步（距离→exp、norm→仿射）融进一个 kernel，别物化 [N,M,D] 大中间量——这是相对广播式参考的内存带宽优势来源。
 4. **shared-memory tiling / 列规约二维分块**：一个 block 协作把输入分块载入 shared 复用。**列规约（如 dgamma/dbeta=Σ_b）用二维分块（行块×连续列、行主序合并读、atomicAdd 跨行块）** —— 实测让 LayerNorm dgamma/dbeta 反向达标。**注意**：对 D 很小（如 D=64）tiling 收益可能被同步开销抵消——先测再上。
 5. **float4 向量化 + 寄存器缓存**：连续维用 `float4` 一次读 4 个（16B 对齐）。**若同一数据要多遍读（如 LayerNorm 前向读 X 三遍求 mean/var/写 Y），把本线程负责的元素缓存进寄存器只读一遍** —— 实测把 LayerNorm 前向 0.93×→1.09×（突破"前向短核天花板"）。
@@ -39,6 +40,7 @@
 **优化手段用错场景会适得其反，且不测就看不出来。实测翻车案例（l2norm_scale 反向优化）**：
 - **寄存器缓存 float4 压爆 occupancy**：为"省第二遍读"把每线程负责的 float4 缓存进寄存器数组（`float4 cx[8],cg[8],cgr[8]`=96 寄存器/线程）→ occupancy 暴跌 → 反向 0.85×**更慢到 0.76×**。**教训**：寄存器缓存只在缓存量小（每线程 1~2 个 float4）时划算；大数组缓存的收益远不抵 occupancy 损失。回退到直接读两遍反而快。
 - **盲调并行度参数**：把 dg 列规约的 `row_blocks` 从 256 降到 32（想减 atomicAdd 竞争）→ 并行度不足、SM 大量闲置 → 反向 0.85×**塌到 0.42×**。**教训**：减 atomic 竞争的收益远不抵并行度损失；256 已是竞争与并行的较优平衡点，凭直觉调反而破坏。
+- **per-element global atomicAdd 做反向融合**：融合 dX+dg 时对每个元素 `atomicAdd(&dg[j], …)`（一 block 一行 → N 行抢同 dg[j] 地址）→ 竞争爆炸 → 反向 0.85×**塌到 0.26×**。**正解**：一 block 管一段行 chunk、shared 私有累积本 chunk 贡献、chunk 末一次性 atomicAdd（atomic 次数从 N 降到行块数）→ 反向 0.84→**1.60×**。**教训**：融合方向对（省重读），但跨行归约的 atomic 粒度决定成败——per-element 竞争爆炸，chunk 级私有累积才对。
 - **通用原则**：①**每加一个优化，必 bench 对比前后**——变慢/无效立即回退，不要"觉得应该更快"就留着；②优化手段有**适用条件**（寄存器缓存要缓存量小、tiling 要 D 够大、float4 要对齐+4的倍数），条件不符会反噬；③**认清本征边界**（见 SKILL.md "何时该停"）——归一化/reduce 家族前向、带宽墙算子本就优化空间小，别为擦 0.02× 硬堆手段翻车，擦线 case 见好就收（够 3 连稳过即可），打不赢的（带宽墙）及时停。
 
 

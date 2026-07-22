@@ -166,6 +166,7 @@ python skill/scripts/bench_case.py --case <name>
 | 线程数 < SM 可驻留量（"一线程一行/一输出"）| occupancy 低 | 降 block 到 256、thread coarsening (E) |
 | 全局访存量 >> 理论下界；同 warp 跨大步长读 | 访存未合并/重复读 | 合并访问、shared tiling、**float4 向量化 + 寄存器缓存**(C/D) |
 | 反向重算了前向已算过的中间量（mean/std、softmax、K…）| 重算 | **前向 `ctx` 缓存复用**(F)——反向决定性一招 |
+| 反向有**多个梯度各用独立 kernel、各自整遍重读同一输入**（如 dX 一个 kernel + dg 一个 kernel 各扫一遍 X/G）| 反向多遍访存 | **多梯度融合到一个 kernel，输入只读一遍**(F)：一 block 管一段行 chunk，读 X/G 一遍同时算 dX 写出 + 用 **shared 私有累积**该 chunk 对跨行梯度（dg 等）的贡献、chunk 末**一次性 atomicAdd**（atomic 次数=行块数≪N，既省重读又避 per-element atomic 竞争）。实测 l2norm_scale 反向 0.84→1.60×。⚠️**别用 per-element global atomicAdd 融合**（N 行抢同地址竞争爆炸，实测 0.85→0.26× 翻车） |
 | 规约（sum/mean/max）占大头 | 规约低效 | warp shuffle 规约、两级归约、**列规约二维分块**(C) |
 | 朴素参考物化 [N,M,D] 等大张量 | 带宽/内存 | 融合不物化 (F) |
 | 算法是**累积/扫描依赖**（前缀和、cumsum、cumprod、扫描类）| 串行依赖 | 用成熟**并行扫描原语**（CUB `BlockScan`/`DeviceScan`，或 Hillis-Steele/Blelloch）；反向是**反向扫描**（`dx[j]=Σ_{i≥j} dy[i]`）。实测 scan 用 CUB block scan 前3.4×/反4.1× 大幅达标 |
