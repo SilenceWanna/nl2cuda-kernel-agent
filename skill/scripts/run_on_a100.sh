@@ -196,13 +196,41 @@ if env $RUN python skill/scripts/verify_case.py --case "$CASE" > /tmp/nl2_verify
     if awk "BEGIN{exit !(($BF+0) < $AUTO_TARGET_MS || ($BB+0) < $AUTO_TARGET_MS)}" 2>/dev/null; then
       echo "[auto-scale] baseline fwd=${BF}ms/bwd=${BB}ms 未达计算主导区(≥${AUTO_TARGET_MS}ms) → 自适应放大"
       SCALE="$AUTO_START"; ITER=0
+      # PREV_OK_LOG：上一个"成功产出有效计时"的规模日志（供 OOM/崩溃回退用）。
+      # 多维乘积规模 case（如 GroupNorm N×C×H×W）放大单一变量会使总张量爆炸 → CUDA OOM，
+      # 此时本轮 bench 拿不到有效 ms（BF/BB 空）——回退到上一成功规模，避免整轮 SSH_ERROR。
+      PREV_OK_LOG=""; PREV_OK_SCALE=""; HALVE_TRIES=0
       while [ "$ITER" -lt 6 ]; do
         ITER=$((ITER+1))
         RUN2="CUDA_VISIBLE_DEVICES=$GPU CUDA_ARCHS=80 $SCALE_VAR=$SCALE"
         rm -rf "$HOME/.cache/torch_extensions"/*/*"$CASE"* 2>/dev/null || true
         env $RUN2 python skill/scripts/bench_case.py --case "$CASE" --emit-verdict > /tmp/nl2_bench.log 2>&1 || true
         BF="$(parse_ms forward)"; BB="$(parse_ms backward)"
+        # OOM/崩溃探测：放大后拿不到有效计时（BF 或 BB 空）→ 多半是显存爆炸（多维乘积规模）。
+        if [ -z "$BF" ] || [ -z "$BB" ]; then
+          if grep -qiE "out of memory|CUDA error|RuntimeError" /tmp/nl2_bench.log 2>/dev/null; then
+            echo "[auto-scale] 第${ITER}轮 $SCALE_VAR=$SCALE bench 无有效计时（疑似 OOM/崩溃，多维规模放大过大）"
+          else
+            echo "[auto-scale] 第${ITER}轮 $SCALE_VAR=$SCALE bench 无有效计时"
+          fi
+          if [ -n "$PREV_OK_LOG" ]; then
+            # 有上一成功规模 → 回退用它的结果（多维 case 放大到 OOM 前的最大可行规模）
+            cp "$PREV_OK_LOG" /tmp/nl2_bench.log
+            echo "[auto-scale] 回退到上一成功规模 $SCALE_VAR=$PREV_OK_SCALE 的结果（避免 OOM 致整轮失败）"
+            break
+          fi
+          # 首轮起点就 OOM（AUTO_START 对该多维 case 过大）→ 减半重试找可行起点，不占放大轮次
+          if [ "$SCALE" -gt 64 ] && [ "$HALVE_TRIES" -lt 8 ]; then
+            HALVE_TRIES=$((HALVE_TRIES+1)); ITER=$((ITER-1)); SCALE=$((SCALE/2))
+            echo "[auto-scale] 起点规模过大致 OOM，减半重试 → $SCALE_VAR=$SCALE"
+            continue
+          fi
+          echo "[auto-scale] 无可行规模（减半到 $SCALE_VAR=$SCALE 仍 OOM），放弃放大用原始结果"
+          break
+        fi
         echo "[auto-scale] 第${ITER}轮 $SCALE_VAR=$SCALE → baseline fwd=${BF}ms/bwd=${BB}ms"
+        # 记为上一成功规模（供下一轮 OOM 回退）
+        PREV_OK_LOG="/tmp/nl2_bench_ok_${SCALE}.log"; cp /tmp/nl2_bench.log "$PREV_OK_LOG"; PREV_OK_SCALE="$SCALE"
         # 计算主导区：前反向均 ≥目标耗时 → 停（结果可信）
         if awk "BEGIN{exit !(($BF+0) >= $AUTO_TARGET_MS && ($BB+0) >= $AUTO_TARGET_MS)}" 2>/dev/null; then
           echo "[auto-scale] 已进入计算主导区(前反向均≥${AUTO_TARGET_MS}ms)，用此规模结果"; break
@@ -214,6 +242,18 @@ if env $RUN python skill/scripts/verify_case.py --case "$CASE" > /tmp/nl2_verify
         fi
         SCALE="$NEXT"
       done
+    fi
+  elif [ -n "$SIZE_ENV" ]; then
+    # 有显式 size-env/bench.env 时不放大（尊重 agent 声明的规模），但仍检查是否短核——
+    # agent 可能（有意或无意）挑了一个 baseline 偏短的规模让固定开销撑高加速比（规模挑选/短核假象）。
+    # 此处只警告不拦（bench.env 是正当机制），把风险暴露给复验者：短核规模的加速比需多规模交叉验证。
+    # —— 实测暴露（GroupNorm gptme）：挑 GN_N=384（baseline 前向仅 0.92ms<1ms）前向擦线 1.07 PASS，
+    #    放大到计算主导区（768/1536）前向掉到 1.048/1.035 FAIL——是规模挑选，非真实优势。
+    BF="$(parse_ms forward)"; BB="$(parse_ms backward)"
+    if [ -n "$BF" ] && [ -n "$BB" ] && \
+       awk "BEGIN{exit !(($BF+0) < $AUTO_TARGET_MS || ($BB+0) < $AUTO_TARGET_MS)}" 2>/dev/null; then
+      echo "[短核警告] 指定规模 '$SIZE_ENV' 的 baseline fwd=${BF}ms/bwd=${BB}ms 未达计算主导区(≥${AUTO_TARGET_MS}ms)——"
+      echo "[短核警告] 加速比可能含固定开销虚高成分（规模挑选/短核假象风险）。复验建议放大规模交叉验证加速比是否稳定。"
     fi
   fi
   echo "---BENCH---"; cat /tmp/nl2_bench.log
