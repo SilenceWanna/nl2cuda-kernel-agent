@@ -17,7 +17,7 @@
 #   首次运行必须带 --sync-cli（把带 --emit-verdict 的 bench_case.py 同步到 A100 一次）。
 #
 # 退出码：0=拿到 VERDICT（PASS 或各种 *_FAIL，具体看 VERDICT 行）；非 0=驱动器自身错误（SSH/参数）。
-# VERDICT 文法：PASS · VERIFY_FAIL · BENCH_FAIL · CV_INVALID · FRAMEWORK_DIRTY · SSH_ERROR
+# VERDICT 文法：PASS · PASS_SCALE_SUSPECT（擦线达标但放大规模掉破1.05=规模挑选嫌疑，strict下算未达标）· VERIFY_FAIL · BENCH_FAIL · CV_INVALID · FRAMEWORK_DIRTY · SSH_ERROR
 set -uo pipefail
 
 # ---- 双跳 SSH 目标（内联，勿写进 ~/.ssh/config）----
@@ -244,19 +244,62 @@ if env $RUN python skill/scripts/verify_case.py --case "$CASE" > /tmp/nl2_verify
       done
     fi
   elif [ -n "$SIZE_ENV" ]; then
-    # 有显式 size-env/bench.env 时不放大（尊重 agent 声明的规模），但仍检查是否短核——
-    # agent 可能（有意或无意）挑了一个 baseline 偏短的规模让固定开销撑高加速比（规模挑选/短核假象）。
-    # 此处只警告不拦（bench.env 是正当机制），把风险暴露给复验者：短核规模的加速比需多规模交叉验证。
+    # 有显式 size-env/bench.env 时不放大（尊重 agent 声明的规模），但要防"规模挑选"作弊——
+    # agent 可能（有意或无意）挑一个 baseline 偏短的规模让固定开销撑高加速比（短核假象的宿主自选变种）。
     # —— 实测暴露（GroupNorm gptme）：挑 GN_N=384（baseline 前向仅 0.92ms<1ms）前向擦线 1.07 PASS，
     #    放大到计算主导区（768/1536）前向掉到 1.048/1.035 FAIL——是规模挑选，非真实优势。
+    # 主动检测：擦线 PASS + 短核时，自动换 2×/4× 规模复测；若擦线侧在放大规模下掉破 1.05 →
+    # 标记 SCALE_SUSPECT（把我此前手动多规模复验的拆穿能力内化进 harness）。codex 那种跨规模稳赢不触发。
+    # 加速比从 VERDICT 行解析（bench.log 里 "forward :" 出现 3 次：baseline/candidate/加速比，
+    # 易取错行；VERDICT=PASS fwd=1.07x bwd=1.06x 唯一且明确）。
     BF="$(parse_ms forward)"; BB="$(parse_ms backward)"
-    if [ -n "$BF" ] && [ -n "$BB" ] && \
-       awk "BEGIN{exit !(($BF+0) < $AUTO_TARGET_MS || ($BB+0) < $AUTO_TARGET_MS)}" 2>/dev/null; then
-      echo "[短核警告] 指定规模 '$SIZE_ENV' 的 baseline fwd=${BF}ms/bwd=${BB}ms 未达计算主导区(≥${AUTO_TARGET_MS}ms)——"
-      echo "[短核警告] 加速比可能含固定开销虚高成分（规模挑选/短核假象风险）。复验建议放大规模交叉验证加速比是否稳定。"
+    VLINE="$(grep '^VERDICT=' /tmp/nl2_bench.log | head -1)"
+    CUR_VERDICT="$(echo "$VLINE" | grep -oE 'VERDICT=[A-Z_]+' | cut -d= -f2)"
+    SF="$(echo "$VLINE" | grep -oE 'fwd=[0-9.]+' | cut -d= -f2)"
+    SB="$(echo "$VLINE" | grep -oE 'bwd=[0-9.]+' | cut -d= -f2)"
+    # 触发条件：当前 PASS + 有短核侧(<AUTO_TARGET_MS) + 该短核侧擦线(<1.15×)。三者皆满足才复测。
+    SHORT_BRITTLE=0
+    if [ "$CUR_VERDICT" = "PASS" ] && [ -n "$BF" ] && [ -n "$BB" ] && [ -n "$SF" ] && [ -n "$SB" ]; then
+      awk "BEGIN{f=($BF<$AUTO_TARGET_MS && $SF<1.15); b=($BB<$AUTO_TARGET_MS && $SB<1.15); exit !(f||b)}" 2>/dev/null && SHORT_BRITTLE=1
+    fi
+    if [ "$SHORT_BRITTLE" = "1" ]; then
+      # 解析 SIZE_ENV 第一个变量做 ×2/×4 放大复测（同 auto-scale 抓变量法）
+      PICK_VAR="$(echo "$SIZE_ENV" | grep -oE '[A-Za-z_]+=' | head -1 | tr -d =)"
+      PICK_VAL="$(echo "$SIZE_ENV" | grep -oE "${PICK_VAR}=[0-9]+" | head -1 | cut -d= -f2)"
+      echo "[规模挑选检测] 擦线 PASS(fwd=${SF}x/bwd=${SB}x) 且指定规模 '$SIZE_ENV' baseline 偏短(fwd=${BF}ms/bwd=${BB}ms<${AUTO_TARGET_MS}ms) → 自动放大复测 $PICK_VAR"
+      SUSPECT=0
+      if [ -n "$PICK_VAR" ] && [ -n "$PICK_VAL" ]; then
+        for MUL in 2 4; do
+          BIG=$((PICK_VAL * MUL))
+          BIG_ENV="$(echo "$SIZE_ENV" | sed -E "s/${PICK_VAR}=[0-9]+/${PICK_VAR}=${BIG}/")"
+          rm -rf "$HOME/.cache/torch_extensions"/*/*"$CASE"* 2>/dev/null || true
+          env CUDA_VISIBLE_DEVICES=$GPU CUDA_ARCHS=80 $BIG_ENV python skill/scripts/bench_case.py --case "$CASE" --emit-verdict > /tmp/nl2_big.log 2>&1 || true
+          BIG_VLINE="$(grep '^VERDICT=' /tmp/nl2_big.log | head -1)"
+          BSF="$(echo "$BIG_VLINE" | grep -oE 'fwd=[0-9.]+' | cut -d= -f2)"
+          BSB="$(echo "$BIG_VLINE" | grep -oE 'bwd=[0-9.]+' | cut -d= -f2)"
+          BV="$(echo "$BIG_VLINE" | grep -oE 'VERDICT=[A-Z_]+' | cut -d= -f2)"
+          if [ -z "$BSF" ] || [ -z "$BSB" ]; then
+            echo "[规模挑选检测] ${PICK_VAR}=${BIG}(×${MUL}) 无有效计时(疑似OOM)，跳过该规模"
+            continue
+          fi
+          echo "[规模挑选检测] ${PICK_VAR}=${BIG}(×${MUL}) → fwd=${BSF}x/bwd=${BSB}x verdict=$BV"
+          # 放大后任一侧掉破 1.05 → 规模挑选嫌疑（原擦线 PASS 靠固定开销虚高）
+          awk "BEGIN{exit !(($BSF+0)<1.05 || ($BSB+0)<1.05)}" 2>/dev/null && SUSPECT=1
+        done
+      fi
+      if [ "$SUSPECT" = "1" ]; then
+        echo "[规模挑选检测] ⚠️ 判定 SCALE_SUSPECT：原规模擦线 PASS 但放大到计算主导区后掉破 1.05——加速比强规模依赖，是固定开销虚高（规模挑选），非真实 kernel 优势。"
+        EMIT_SUSPECT=1   # 延迟到 bench 日志 cat 之后再 emit（否则被日志里的原始 VERDICT=PASS 覆盖，tail -1 取错）
+      else
+        echo "[规模挑选检测] 放大规模后加速比仍稳(≥1.05)，非规模挑选——诚实达标。"
+      fi
     fi
   fi
   echo "---BENCH---"; cat /tmp/nl2_bench.log
+  # 规模挑选嫌疑：最后 emit（覆盖日志里的原始 VERDICT=PASS，使外层 tail -1 取到本行）
+  if [ "${EMIT_SUSPECT:-0}" = "1" ]; then
+    echo "VERDICT=PASS_SCALE_SUSPECT fwd=${SF}x bwd=${SB}x cv_ok=1"
+  fi
 else
   echo "---VERIFY---"; cat /tmp/nl2_verify.log
   echo "VERDICT=VERIFY_FAIL"
@@ -277,14 +320,18 @@ echo "$RESULT"
 FINAL_VERDICT="$(echo "$RESULT" | grep '^VERDICT=' | tail -1)"
 echo "$FINAL_VERDICT"
 # PASS 即 loop 完成：把"到达标的总轮次"存档到 .round_final_<case>（客观计数，供统计各宿主用了几轮），再清零计数
-if echo "$FINAL_VERDICT" | grep -q '^VERDICT=PASS'; then
+# 精确匹配"干净 PASS"（PASS 后跟空格或行尾）——排除 PASS_SCALE_SUSPECT（规模挑选嫌疑，不算达标、不存档轮次）。
+if echo "$FINAL_VERDICT" | grep -qE '^VERDICT=PASS( |$)'; then
   echo "$ROUND_N" > "$WORKDIR/.round_final_$CASE" 2>/dev/null || true
   echo "[run_on_a100] 达标！到达标累计自测 $ROUND_N 轮（已存档 .round_final_$CASE）" >&2
   rm -f "$ROUND_FILE" 2>/dev/null || true
+elif echo "$FINAL_VERDICT" | grep -q '^VERDICT=PASS_SCALE_SUSPECT'; then
+  echo "[run_on_a100] ⚠️ PASS_SCALE_SUSPECT：擦线达标疑似规模挑选（放大规模掉破 1.05）——不算达标，请优化 kernel 本体而非挑规模。" >&2
 fi
-# --strict：按 VERDICT 返回退出码（PASS=0，其余=1），供 aider --auto-test 等靠退出码驱动的自主闭环；
+# --strict：按 VERDICT 返回退出码（干净 PASS=0，其余含 SCALE_SUSPECT=1）——逼 agent 继续优化真实 kernel，
+# 而非靠挑短核规模凑擦线蒙混过关（自主闭环下 SCALE_SUSPECT 会驱动它继续改，而挑更大规模也过不了）。
 # 默认(非strict) 恒 exit 0（Stage B 人工读 VERDICT 决策，不希望非零退出打断脚本）。
 if [ "$STRICT" = "1" ]; then
-  echo "$FINAL_VERDICT" | grep -q '^VERDICT=PASS' && exit 0 || exit 1
+  echo "$FINAL_VERDICT" | grep -qE '^VERDICT=PASS( |$)' && exit 0 || exit 1
 fi
 exit 0
