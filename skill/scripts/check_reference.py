@@ -107,6 +107,54 @@ def scan_reference(src):
     return findings
 
 
+def _strip_c_comments(src):
+    """去 C/C++ 注释（// 和 /* */）+ 字符串字面量，避免注释里的字样误报。"""
+    src = re.sub(r"/\*[\s\S]*?\*/", "", src)   # 块注释
+    out = []
+    for line in src.splitlines():
+        if "//" in line:
+            line = line[: line.index("//")]
+        line = re.sub(r'"[^"]*"', '""', line)
+        out.append(line)
+    return "\n".join(out)
+
+
+def scan_kernels(root, case):
+    """扫 cases/<case>/kernels/*.cu 的性能灾难写法（candidate kernel，非 reference）。
+
+    返回 [(severity, code, msg)]。当前抓 layernorm 式 O(N^2) 重算灾难：
+    外层按样本/行循环、内层又整维规约（重算本可缓存/一次算出的量），如
+        for (int b=0; b<B; ++b) { for (int k=0; k<D; ++k) mean += x[..k]; ... }
+    这类"每次外层迭代重算一遍全维规约"是 O(B·D^2) 灾难（layernorm 主仓朴素版曾卡 1228ms）。
+    正解：一 block 一行 block 内规约一次 + 缓存 mean/rstd 供复用（见 SKILL 列规约/缓存复用）。
+    """
+    import glob
+    findings = []
+    kdir = os.path.join(root, "cases", case, "kernels")
+    for cu in sorted(glob.glob(os.path.join(kdir, "*.cu"))):
+        code = _strip_c_comments(_read(cu))
+        # 按 __global__ 切分 kernel 函数体，逐个查嵌套 for + 内层累加
+        for km in re.finditer(r"__global__[\s\S]*?\{([\s\S]*?)\n\}", code):
+            body = km.group(1)
+            # 找形如 for(...; VAR < BOUND; ...) 的循环头，且循环变量步进为 ++（非 grid-stride 的 +=blockDim）
+            # grid-stride（d += blockDim.x / gridDim）是正常并行，不算灾难；++/++VAR 的串行标量循环才可疑。
+            fors = list(re.finditer(r"for\s*\(([^;]*);([^;]*);([^)]*)\)", body))
+            for i, outer in enumerate(fors):
+                step = outer.group(3)
+                is_serial = re.search(r"\+\+|\-\-|\+=\s*1\b", step) and not re.search(r"blockDim|gridDim|blockIdx|warpSize|\*\s*\d", step)
+                if not is_serial:
+                    continue
+                # 外层是串行标量循环（如 for b<B ++b）——看其后是否紧跟另一个 for 且内含 += 累加（重算规约）
+                tail = body[outer.end(): outer.end() + 400]
+                if re.search(r"for\s*\(", tail) and re.search(r"[a-zA-Z_]\w*\s*\+=", tail):
+                    findings.append(("WARN", "kernel-nested-recompute",
+                                     f"{os.path.basename(cu)}: 疑似嵌套 for 重算规约（外层串行循环内再整维累加）——"
+                                     f"若是'每行/每列重算全维 mean/var/sum'即 O(N^2) 性能灾难（layernorm 朴素版曾卡 1228ms）；"
+                                     f"应一 block 一行 block 内规约一次 + 缓存中间量复用。若是小 K 展开/GEMM tiling 可忽略"))
+                    break  # 每 kernel 报一次即可
+    return findings
+
+
 def scan_make_inputs(src):
     """扫 make_inputs 有无挑异常输入分布迁就脆弱 reference。返回 [(severity, code, msg)]。"""
     findings = []
@@ -151,11 +199,11 @@ def main():
         return 1 if args.strict else 0
 
     src = _read(ref_path)
-    findings = scan_reference(src) + scan_make_inputs(src)
+    findings = scan_reference(src) + scan_make_inputs(src) + scan_kernels(root, args.case)
 
     print(f"=== reference 静态扫描: case={args.case} ===")
     if not findings:
-        print("  无可疑写法（for/T^2-Toeplitz/规模分支/cumprod-脆弱/高层算子/挑输入分布 均未命中）")
+        print("  无可疑写法（for/T^2-Toeplitz/规模分支/cumprod-脆弱/高层算子/挑输入分布/kernel嵌套重算 均未命中）")
         print("REF_CHECK=CLEAN")
         return 0
 
