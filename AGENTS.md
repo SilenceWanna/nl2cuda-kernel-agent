@@ -16,9 +16,13 @@
 
 收到这类输入后，**不要等用户给更多指令**，直接按以下流程执行：
 
+> **⚠️ 硬规则（先于步骤 0.5 判定，实测 codex 反复栽）——"点了算子名"不等于"规格已定、可跳确认"**：
+> 很多算子有**多种标准变体**，点名不消除歧义：grid_sample（边界 zeros/border/reflection、align_corners、求梯度对象 input 还是 input+grid、bilinear/nearest）、segment_softmax/scatter（段有序否、values 是 [N] 标量还是 [N,D]、求梯度对象）、attention（causal/多头/scale）、conv（padding/stride/dilation/groups）、pool（kernel/stride/ceil_mode）等。
+> **判定：无论用户是否点了明确算子名、是否给了部分公式，只要该算子存在这类"多解变体选项"（尤其求梯度对象/边界/维度/段序这类直接改变 reference 和反向的），就必须先走确认——列出你采取的每个变体默认 + 备选，呈请确认，未确认不得建 case。** 别因"我认得这算子、它有 PyTorch 默认语义"就跳过——PyTorch 默认≠用户要的默认（实测 codex 见"相当于 grid_sample"直接把"只对 input"擅自扩成"input+grid 都求"；见 grid_sample §31）。只有当**所有变体选项都已由用户明确给定**（前向公式/shape/grad_inputs/边界对齐等全明确）时才跳过确认。
+
 **步骤 0.5（当用户只给真正的自然语言、不含数学公式/精确 shape 时）**：先**推导数学规格**呈请确认，再动工。
 产出两部分给用户：① **结构化数学规格**——前向数学公式/伪代码 + 各输入名字/形状/dtype + 输出 + `grad_inputs` + 标量参数 + **⚠️语义澄清点**（凡自然语言有多种合理解释处，显式列出你采取的解释+备选，如"‘归一化’按 LayerNorm 理解，若要 L2 请指出"）；② 按规范写的 **PyTorch reference.py 代码**。**然后停下等用户确认或修正——用户未确认数学前，不得建 `cases/<name>/`、不得写 kernel**。这是唯一的人类确认闸门（只在数学层一次）；确认后按下面 1→5 **全自动跑完**不再中途停，确认过的数学规格即 `description.md`。
-（若用户已给明确前向公式+shape/dtype，数学已定，**跳过步骤 0.5**直接下面第 1 步。）
+（若用户已给明确前向公式+shape/dtype **且无多解变体待定**，数学已定，**跳过步骤 0.5**直接下面第 1 步。）
 
 1. **先读 `skill/SKILL.md`**（方法论主体，尤其"Case 协议""CUDA Kernel 实现技巧""防作弊红线""达标判据"）
    和 `skill/DESIGN.md`、`framework/case.py`。`framework/` 对你**只读**。
