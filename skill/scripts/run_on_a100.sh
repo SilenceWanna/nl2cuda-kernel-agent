@@ -96,8 +96,15 @@ if [ "$AUTO_SCALE" = "1" ] && [ -z "$SIZE_ENV" ]; then
   # 取 config.py 第一个 os.environ.get("XXX", ...) 的变量名（如 RMS_B / SCAN_B / LN_B）
   SCALE_VAR="$(grep -oE 'os\.environ\.get\("[A-Za-z_]+"' "$WORKDIR/cases/$CASE/config.py" 2>/dev/null \
                | head -1 | sed -E 's/.*"([A-Za-z_]+)".*/\1/')"
+  # 数一共有几个规模 env 变量：≥3 个 = 多维 config（N×C×H×W…），auto-scale 只放大第一个会病态。
+  SCALE_VAR_COUNT="$(grep -oE 'os\.environ\.get\("[A-Za-z_]+"' "$WORKDIR/cases/$CASE/config.py" 2>/dev/null | wc -l | tr -d ' ')"
   if [ -z "$SCALE_VAR" ]; then
     echo "[run_on_a100] 提示：无 size-env/bench.env 且 config 未参数化规模，无法自动放大——结果可能是短核虚高。" >&2
+  elif [ "${SCALE_VAR_COUNT:-1}" -ge 3 ] 2>/dev/null; then
+    # 多维乘积规模 case（如 grid_sample N×C×H×W×OH×OW、GroupNorm N×C×H×W）：auto-scale 只放大首变量
+    # $SCALE_VAR 会造成病态形状（batch 巨大、空间小 → 前向假暴/加速比失真）或爆显存（多维乘积 OOM）。
+    # 强烈建议 agent 建 bench.env 声明**平衡**的计算主导区规模。此处仍会兜底放大首变量，但警示风险。
+    echo "[run_on_a100] ⚠️ 多维规模 config（探到 $SCALE_VAR_COUNT 个规模变量,首=$SCALE_VAR）：auto-scale 只放大首变量易病态形状(batch大空间小→加速比失真)或OOM。**强烈建议建 cases/$CASE/bench.env 声明平衡规模**(如各维适度放大而非单放 batch)。当前无 bench.env→仍兜底放大 $SCALE_VAR,结果可能失真,请以平衡 bench.env 规模为准。" >&2
   else
     echo "[run_on_a100] auto-scale 待命：若探到短核，将从 $SCALE_VAR=$AUTO_START 起自适应放大(×4/轮)到 baseline≥${AUTO_TARGET_MS}ms 或上限 $AUTO_MAX。" >&2
   fi

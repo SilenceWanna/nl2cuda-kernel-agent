@@ -96,6 +96,8 @@ def make_inputs(seed, dtype, device, requires_grad=False):
 **触发条件**：用户的描述是**真正的自然语言意图**、**不含明确的数学公式/精确 shape**（如"我想要一个把每行归一化到均值0方差1再缩放的操作"、"做一个带因果 mask 的注意力"）。此时**不要直接开写 reference/kernel**——你要先把自然语言**推导成精确的数学规格**，呈请用户确认后再动工。
 （若用户已经给了明确的前向数学公式 + shape/dtype，说明数学已确定，**跳过本步**直接进步骤 1。）
 
+**⚠️ 点了明确算子名 ≠ 规格已定，仍须走闸门（grid_sample 实测教训）**：用户说"相当于 grid_sample / 就是 layer_norm / 类似 grid_sample"这类**点了明确算子名**时，别以为"该算子有 PyTorch 默认语义、规格已确定"就跳过闸门直接实现——**很多算子有多种标准变体**：grid_sample（边界 zeros/border/reflection、align_corners True/False、对 input 还是 input+grid 求梯度、bilinear/nearest）、attention（causal/多头/scale）、conv（padding/stride/dilation/groups）等。**凡该算子有这类多解选项，即使点了名仍须先按步骤 0.5 呈请确认**（列出你采取的默认 + 备选，尤其求梯度对象/边界/对齐这类直接影响 reference 和反向的选项）。**实测**：codex 见"相当于 grid_sample"直接跳闸门开写、还擅自把"只对 input"扩成"input+grid 都求"——点算子名诱发跳过。对比同款意图**不点算子名、纯描述**（"按坐标去特征图双线性插值取值"）→ codex/aider/gptme 都正确进闸门。**判据**：能一句话点出算子名的，先想"这算子有几种标准变体？"——有多解就走闸门。
+
 **为什么**：真实用户往往只有模糊意图、不会写公式。自然语言天然有歧义（"归一化"是 LayerNorm 还是 L2？"注意力"要不要 causal mask / 多头？规约沿哪一维？）。若你擅自假设一种数学理解就一路跑到 kernel，理解错了要推倒重来。**先对齐数学、再自动实现**——把"数学建模"责任接过来，但用一个人类确认闸门兜住歧义。
 
 **产出（呈请用户确认的"数学规格"，两部分都给）**：
