@@ -266,7 +266,7 @@ if env $RUN python skill/scripts/verify_case.py --case "$CASE" > /tmp/nl2_verify
       # 解析 SIZE_ENV 第一个变量做 ×2/×4 放大复测（同 auto-scale 抓变量法）
       PICK_VAR="$(echo "$SIZE_ENV" | grep -oE '[A-Za-z_]+=' | head -1 | tr -d =)"
       PICK_VAL="$(echo "$SIZE_ENV" | grep -oE "${PICK_VAR}=[0-9]+" | head -1 | cut -d= -f2)"
-      echo "[规模挑选检测] 擦线 PASS(fwd=${SF}x/bwd=${SB}x) 且指定规模 '$SIZE_ENV' baseline 偏短(fwd=${BF}ms/bwd=${BB}ms<${AUTO_TARGET_MS}ms) → 自动放大复测 $PICK_VAR"
+      echo "[规模敏感复测] 擦线 PASS(fwd=${SF}x/bwd=${SB}x) 且指定规模 '$SIZE_ENV' baseline 偏短(fwd=${BF}ms/bwd=${BB}ms<${AUTO_TARGET_MS}ms) → 自动放大复测 $PICK_VAR"
       SUSPECT=0
       if [ -n "$PICK_VAR" ] && [ -n "$PICK_VAL" ]; then
         for MUL in 2 4; do
@@ -279,19 +279,19 @@ if env $RUN python skill/scripts/verify_case.py --case "$CASE" > /tmp/nl2_verify
           BSB="$(echo "$BIG_VLINE" | grep -oE 'bwd=[0-9.]+' | cut -d= -f2)"
           BV="$(echo "$BIG_VLINE" | grep -oE 'VERDICT=[A-Z_]+' | cut -d= -f2)"
           if [ -z "$BSF" ] || [ -z "$BSB" ]; then
-            echo "[规模挑选检测] ${PICK_VAR}=${BIG}(×${MUL}) 无有效计时(疑似OOM)，跳过该规模"
+            echo "[规模敏感复测] ${PICK_VAR}=${BIG}(×${MUL}) 无有效计时(疑似OOM)，跳过该规模"
             continue
           fi
-          echo "[规模挑选检测] ${PICK_VAR}=${BIG}(×${MUL}) → fwd=${BSF}x/bwd=${BSB}x verdict=$BV"
-          # 放大后任一侧掉破 1.05 → 规模挑选嫌疑（原擦线 PASS 靠固定开销虚高）
+          echo "[规模敏感复测] ${PICK_VAR}=${BIG}(×${MUL}) → fwd=${BSF}x/bwd=${BSB}x verdict=$BV"
+          # 放大后任一侧掉破 1.05 → 前向达标存疑（原擦线 PASS 靠短核固定开销虚高，与是否"主动挑规模"无关）
           awk "BEGIN{exit !(($BSF+0)<1.05 || ($BSB+0)<1.05)}" 2>/dev/null && SUSPECT=1
         done
       fi
       if [ "$SUSPECT" = "1" ]; then
-        echo "[规模挑选检测] ⚠️ 判定 SCALE_SUSPECT：原规模擦线 PASS 但放大到计算主导区后掉破 1.05——加速比强规模依赖，是固定开销虚高（规模挑选），非真实 kernel 优势。"
+        echo "[规模敏感复测] ⚠️ 判定 SCALE_SUSPECT：原规模擦线 PASS 但放大到计算主导区后掉破 1.05——加速比强规模依赖=短核固定开销虚高，非真实 kernel 优势（存疑，非作弊指控：固定 bench.env 的历史短核 case 与主动挑规模都会命中，都应在计算主导区复核）。"
         EMIT_SUSPECT=1   # 延迟到 bench 日志 cat 之后再 emit（否则被日志里的原始 VERDICT=PASS 覆盖，tail -1 取错）
       else
-        echo "[规模挑选检测] 放大规模后加速比仍稳(≥1.05)，非规模挑选——诚实达标。"
+        echo "[规模敏感复测] 放大规模后加速比仍稳(≥1.05)，非短核虚高——诚实达标。"
       fi
     fi
   fi
@@ -326,7 +326,7 @@ if echo "$FINAL_VERDICT" | grep -qE '^VERDICT=PASS( |$)'; then
   echo "[run_on_a100] 达标！到达标累计自测 $ROUND_N 轮（已存档 .round_final_$CASE）" >&2
   rm -f "$ROUND_FILE" 2>/dev/null || true
 elif echo "$FINAL_VERDICT" | grep -q '^VERDICT=PASS_SCALE_SUSPECT'; then
-  echo "[run_on_a100] ⚠️ PASS_SCALE_SUSPECT：擦线达标疑似规模挑选（放大规模掉破 1.05）——不算达标，请优化 kernel 本体而非挑规模。" >&2
+  echo "[run_on_a100] ⚠️ PASS_SCALE_SUSPECT：擦线达标存疑（放大规模掉破 1.05=短核固定开销虚高）——不算达标，请在计算主导区规模优化 kernel 本体到稳过。" >&2
 fi
 # --strict：按 VERDICT 返回退出码（干净 PASS=0，其余含 SCALE_SUSPECT=1）——逼 agent 继续优化真实 kernel，
 # 而非靠挑短核规模凑擦线蒙混过关（自主闭环下 SCALE_SUSPECT 会驱动它继续改，而挑更大规模也过不了）。
