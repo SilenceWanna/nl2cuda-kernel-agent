@@ -1,124 +1,224 @@
-// LayerNorm 反向 kernel（朴素正确版）。
-// 记 xhat=(x-mean)/std, std=sqrt(var+eps), 上游梯度 G=dL/dY。
-//   dgamma[d] = Σ_b G[b,d]*xhat[b,d]
-//   dbeta[d]  = Σ_b G[b,d]
-//   g1[b,d]=G[b,d]*gamma[d];  m1_b=mean_d g1[b,:];  m2_b=mean_d (g1[b,:]*xhat[b,:])
-//   dX[b,d] = (1/std_b) * ( g1[b,d] - m1_b - xhat[b,d]*m2_b )
-//
-// 策略：
-//   dX kernel：一个 block 处理一行 b，block 内重算 mean/std，再规约 m1/m2，写 dX 行。
-//   dgamma/dbeta kernel：一个线程负责一列 d，沿 B 归约（朴素）。
-
 #include <torch/extension.h>
+
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-// 一个 block 处理一行 b，求 dX[b,:]
-__global__ void layernorm_backward_dX_kernel(
-        const float* __restrict__ X,      // [B,D]
-        const float* __restrict__ G,      // [B,D] 上游
-        const float* __restrict__ gamma,  // [D]
-        float* __restrict__ dX,           // [B,D]
-        int B, int D, float eps) {
-    int b = blockIdx.x;
-    if (b >= B) return;
-    const float* xrow = X + (size_t)b * D;
-    const float* grow = G + (size_t)b * D;
-    float* dxrow = dX + (size_t)b * D;
+std::vector<torch::Tensor> layernorm_forward(
+    torch::Tensor x,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    double eps);
 
-    extern __shared__ float sdata[];
+namespace {
 
-    // mean
-    float local = 0.0f;
-    for (int d = threadIdx.x; d < D; d += blockDim.x) local += xrow[d];
-    sdata[threadIdx.x] = local; __syncthreads();
-    for (int s = blockDim.x/2; s>0; s>>=1) { if (threadIdx.x<s) sdata[threadIdx.x]+=sdata[threadIdx.x+s]; __syncthreads(); }
-    float mean = sdata[0]/D; __syncthreads();
+constexpr int kBlockSize = 256;
+constexpr int kColTile = 32;
+constexpr int kRowTile = 8;
 
-    // var
-    float localv = 0.0f;
-    for (int d = threadIdx.x; d < D; d += blockDim.x) { float df=xrow[d]-mean; localv+=df*df; }
-    sdata[threadIdx.x]=localv; __syncthreads();
-    for (int s=blockDim.x/2; s>0; s>>=1){ if(threadIdx.x<s) sdata[threadIdx.x]+=sdata[threadIdx.x+s]; __syncthreads(); }
-    float var = sdata[0]/D;
-    float rstd = rsqrtf(var+eps); __syncthreads();
-
-    // m1 = mean_d g1 ;  g1 = G*gamma
-    float lm1 = 0.0f;
-    for (int d=threadIdx.x; d<D; d+=blockDim.x) lm1 += grow[d]*gamma[d];
-    sdata[threadIdx.x]=lm1; __syncthreads();
-    for (int s=blockDim.x/2; s>0; s>>=1){ if(threadIdx.x<s) sdata[threadIdx.x]+=sdata[threadIdx.x+s]; __syncthreads(); }
-    float m1 = sdata[0]/D; __syncthreads();
-
-    // m2 = mean_d (g1 * xhat)
-    float lm2 = 0.0f;
-    for (int d=threadIdx.x; d<D; d+=blockDim.x) {
-        float xhat = (xrow[d]-mean)*rstd;
-        lm2 += (grow[d]*gamma[d]) * xhat;
+__inline__ __device__ float warp_reduce_sum(float v) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        v += __shfl_down_sync(0xffffffff, v, offset);
     }
-    sdata[threadIdx.x]=lm2; __syncthreads();
-    for (int s=blockDim.x/2; s>0; s>>=1){ if(threadIdx.x<s) sdata[threadIdx.x]+=sdata[threadIdx.x+s]; __syncthreads(); }
-    float m2 = sdata[0]/D; __syncthreads();
+    return v;
+}
 
-    // dX[b,d] = rstd * ( g1 - m1 - xhat*m2 )
-    for (int d=threadIdx.x; d<D; d+=blockDim.x) {
-        float xhat = (xrow[d]-mean)*rstd;
-        float g1 = grow[d]*gamma[d];
-        dxrow[d] = rstd * (g1 - m1 - xhat*m2);
+__inline__ __device__ float block_reduce_sum(float v) {
+    __shared__ float shared[32];
+
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    const int num_warps = (blockDim.x + 31) >> 5;
+
+    v = warp_reduce_sum(v);
+
+    if (lane == 0) {
+        shared[wid] = v;
+    }
+    __syncthreads();
+
+    v = (threadIdx.x < num_warps) ? shared[lane] : 0.0f;
+
+    if (wid == 0) {
+        v = warp_reduce_sum(v);
+    }
+
+    if (threadIdx.x == 0) {
+        shared[0] = v;
+    }
+    __syncthreads();
+
+    return shared[0];
+}
+
+__global__ void layernorm_backward_x_kernel(
+    const float* __restrict__ grad_y,
+    const float* __restrict__ x,
+    const float* __restrict__ gamma,
+    const float* __restrict__ mean,
+    const float* __restrict__ inv_std,
+    float* __restrict__ grad_x,
+    int B,
+    int D) {
+    const int b = blockIdx.x;
+    if (b >= B) {
+        return;
+    }
+
+    const int row = b * D;
+    const float m = mean[b];
+    const float inv = inv_std[b];
+
+    // dX = inv_std * (v - mean(v) - xhat * mean(v*xhat)),
+    // where v = dY * gamma and xhat = (X - mean) * inv_std.
+    float sum_v = 0.0f;
+    float sum_v_xhat = 0.0f;
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        const float xhat = (x[row + d] - m) * inv;
+        const float v = grad_y[row + d] * gamma[d];
+        sum_v += v;
+        sum_v_xhat += v * xhat;
+    }
+
+    sum_v = block_reduce_sum(sum_v);
+    sum_v_xhat = block_reduce_sum(sum_v_xhat);
+
+    const float mean_v = sum_v / static_cast<float>(D);
+    const float mean_v_xhat = sum_v_xhat / static_cast<float>(D);
+
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        const float xhat = (x[row + d] - m) * inv;
+        const float v = grad_y[row + d] * gamma[d];
+        grad_x[row + d] = inv * (v - mean_v - xhat * mean_v_xhat);
     }
 }
 
-// 一个线程负责一列 d，沿 B 归约求 dgamma[d]、dbeta[d]
-__global__ void layernorm_backward_dparam_kernel(
-        const float* __restrict__ X,      // [B,D]
-        const float* __restrict__ G,      // [B,D]
-        float* __restrict__ dgamma,       // [D]
-        float* __restrict__ dbeta,        // [D]
-        int B, int D, float eps) {
-    int d = blockIdx.x * blockDim.x + threadIdx.x;
-    if (d >= D) return;
-
-    float dg = 0.0f, db = 0.0f;
-    for (int b = 0; b < B; ++b) {
-        const float* xrow = X + (size_t)b * D;
-        // 重算该行 mean/std
-        float mean = 0.0f;
-        for (int k = 0; k < D; ++k) mean += xrow[k];
-        mean /= D;
-        float var = 0.0f;
-        for (int k = 0; k < D; ++k) { float df = xrow[k]-mean; var += df*df; }
-        var /= D;
-        float rstd = rsqrtf(var + eps);
-        float xhat = (xrow[d] - mean) * rstd;
-        float g = G[(size_t)b * D + d];
-        dg += g * xhat;
-        db += g;
+__global__ void zero_vector_kernel(float* __restrict__ a, float* __restrict__ b, int D) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < D) {
+        a[i] = 0.0f;
+        b[i] = 0.0f;
     }
-    dgamma[d] = dg;
-    dbeta[d] = db;
 }
+
+// 2D row/column tiled partial reduction for dgamma/dbeta.
+// Thread x maps to contiguous columns, so reads of X/dY are coalesced.
+// Different row tiles accumulate with atomics into the final [D] vectors.
+__global__ void layernorm_backward_param_kernel(
+    const float* __restrict__ grad_y,
+    const float* __restrict__ x,
+    const float* __restrict__ mean,
+    const float* __restrict__ inv_std,
+    float* __restrict__ grad_gamma,
+    float* __restrict__ grad_beta,
+    int B,
+    int D) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row_start = blockIdx.y * kRowTile;
+
+    if (col >= D) {
+        return;
+    }
+
+    float sum_gamma = 0.0f;
+    float sum_beta = 0.0f;
+
+#pragma unroll
+    for (int r = 0; r < kRowTile; ++r) {
+        const int b = row_start + r;
+        if (b < B) {
+            const int idx = b * D + col;
+            const float gy = grad_y[idx];
+            const float xhat = (x[idx] - mean[b]) * inv_std[b];
+            sum_gamma += gy * xhat;
+            sum_beta += gy;
+        }
+    }
+
+    atomicAdd(grad_gamma + col, sum_gamma);
+    atomicAdd(grad_beta + col, sum_beta);
+}
+
+void check_backward_inputs(
+    const torch::Tensor& grad_y,
+    const torch::Tensor& x,
+    const torch::Tensor& gamma,
+    const torch::Tensor& mean,
+    const torch::Tensor& inv_std) {
+    TORCH_CHECK(grad_y.is_cuda(), "grad_y must be CUDA");
+    TORCH_CHECK(x.is_cuda(), "X must be CUDA");
+    TORCH_CHECK(gamma.is_cuda(), "gamma must be CUDA");
+    TORCH_CHECK(mean.is_cuda(), "mean must be CUDA");
+    TORCH_CHECK(inv_std.is_cuda(), "inv_std must be CUDA");
+    TORCH_CHECK(grad_y.scalar_type() == torch::kFloat32, "grad_y must be float32");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "X must be float32");
+    TORCH_CHECK(gamma.scalar_type() == torch::kFloat32, "gamma must be float32");
+    TORCH_CHECK(mean.scalar_type() == torch::kFloat32, "mean must be float32");
+    TORCH_CHECK(inv_std.scalar_type() == torch::kFloat32, "inv_std must be float32");
+    TORCH_CHECK(grad_y.dim() == 2, "grad_y must have shape [B, D]");
+    TORCH_CHECK(x.dim() == 2, "X must have shape [B, D]");
+    TORCH_CHECK(gamma.dim() == 1, "gamma must have shape [D]");
+    TORCH_CHECK(mean.dim() == 1, "mean must have shape [B]");
+    TORCH_CHECK(inv_std.dim() == 1, "inv_std must have shape [B]");
+    TORCH_CHECK(grad_y.is_contiguous(), "grad_y must be contiguous");
+    TORCH_CHECK(x.is_contiguous(), "X must be contiguous");
+    TORCH_CHECK(gamma.is_contiguous(), "gamma must be contiguous");
+    TORCH_CHECK(mean.is_contiguous(), "mean must be contiguous");
+    TORCH_CHECK(inv_std.is_contiguous(), "inv_std must be contiguous");
+    TORCH_CHECK(grad_y.size(0) == x.size(0), "grad_y B must match X B");
+    TORCH_CHECK(grad_y.size(1) == x.size(1), "grad_y D must match X D");
+    TORCH_CHECK(gamma.size(0) == x.size(1), "gamma length must equal D");
+    TORCH_CHECK(mean.size(0) == x.size(0), "mean length must equal B");
+    TORCH_CHECK(inv_std.size(0) == x.size(0), "inv_std length must equal B");
+}
+
+}  // namespace
 
 std::vector<torch::Tensor> layernorm_backward(
-        torch::Tensor X, torch::Tensor G, torch::Tensor gamma, double eps) {
-    TORCH_CHECK(X.is_cuda() && G.is_cuda() && gamma.is_cuda(), "inputs must be CUDA");
-    X = X.contiguous(); G = G.contiguous(); gamma = gamma.contiguous();
-    int B = X.size(0), D = X.size(1);
+    torch::Tensor grad_y,
+    torch::Tensor x,
+    torch::Tensor gamma,
+    torch::Tensor mean,
+    torch::Tensor inv_std) {
+    check_backward_inputs(grad_y, x, gamma, mean, inv_std);
 
-    auto dX = torch::empty_like(X);
-    auto dgamma = torch::empty({D}, X.options());
-    auto dbeta = torch::empty({D}, X.options());
+    const int B = static_cast<int>(x.size(0));
+    const int D = static_cast<int>(x.size(1));
 
-    const int threads = 256;
-    layernorm_backward_dX_kernel<<<B, threads, threads*sizeof(float)>>>(
-        X.data_ptr<float>(), G.data_ptr<float>(), gamma.data_ptr<float>(),
-        dX.data_ptr<float>(), B, D, (float)eps);
-    layernorm_backward_dparam_kernel<<<(D+threads-1)/threads, threads>>>(
-        X.data_ptr<float>(), G.data_ptr<float>(),
-        dgamma.data_ptr<float>(), dbeta.data_ptr<float>(), B, D, (float)eps);
+    auto grad_x = torch::empty_like(x);
+    auto grad_gamma = torch::empty_like(gamma);
+    auto grad_beta = torch::empty_like(gamma);
 
-    return {dX, dgamma, dbeta};
+    zero_vector_kernel<<<(D + kBlockSize - 1) / kBlockSize, kBlockSize>>>(
+        grad_gamma.data_ptr<float>(),
+        grad_beta.data_ptr<float>(),
+        D);
+
+    layernorm_backward_x_kernel<<<B, kBlockSize>>>(
+        grad_y.data_ptr<float>(),
+        x.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        mean.data_ptr<float>(),
+        inv_std.data_ptr<float>(),
+        grad_x.data_ptr<float>(),
+        B,
+        D);
+
+    const dim3 param_block(kColTile);
+    const dim3 param_grid((D + kColTile - 1) / kColTile, (B + kRowTile - 1) / kRowTile);
+    layernorm_backward_param_kernel<<<param_grid, param_block>>>(
+        grad_y.data_ptr<float>(),
+        x.data_ptr<float>(),
+        mean.data_ptr<float>(),
+        inv_std.data_ptr<float>(),
+        grad_gamma.data_ptr<float>(),
+        grad_beta.data_ptr<float>(),
+        B,
+        D);
+
+    return {grad_x, grad_gamma, grad_beta};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("layernorm_backward", &layernorm_backward, "LayerNorm backward (CUDA, naive)");
+    m.def("layernorm_forward", &layernorm_forward, "LayerNorm forward (CUDA)");
+    m.def("layernorm_backward", &layernorm_backward, "LayerNorm backward (CUDA)");
 }

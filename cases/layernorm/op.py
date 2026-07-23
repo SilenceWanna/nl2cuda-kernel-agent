@@ -1,53 +1,64 @@
-"""LayerNorm kernel 的候选实现封装（dict 接口，符合 framework 候选契约）。
-
-candidate(inputs, params) -> Y，对 inputs["X"]/["gamma"]/["beta"] 提供梯度。
-kernel 源在 cases/layernorm/kernels/，由 framework.loader 即时编译。float32-only。
-"""
+"""Autograd wrapper for the custom CUDA LayerNorm implementation."""
 
 import os
-import functools
 
 import torch
 
 from framework.loader import load_kernel
 
-_KDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels")
+
+_KERNEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels")
+_MODULE = None
 
 
-@functools.lru_cache(maxsize=1)
-def _fwd_module():
-    return load_kernel("layernorm_forward", ["layernorm_forward.cu"], base_dir=_KDIR)
+def _load_module():
+    global _MODULE
+    if _MODULE is None:
+        _MODULE = load_kernel(
+            name="layernorm_cuda_ext",
+            sources=["layernorm_forward.cu", "layernorm_backward.cu"],
+            base_dir=_KERNEL_DIR,
+            verbose=True,
+        )
+    return _MODULE
 
 
-@functools.lru_cache(maxsize=1)
-def _bwd_module():
-    return load_kernel("layernorm_backward", ["layernorm_backward.cu"], base_dir=_KDIR)
-
-
-class LayerNormFunction(torch.autograd.Function):
+class _LayerNormFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, X, gamma, beta, eps):
-        Y = _fwd_module().layernorm_forward(X, gamma, beta, float(eps))
-        ctx.save_for_backward(X, gamma)
-        ctx.eps = float(eps)
-        return Y
+    def forward(ctx, x, gamma, beta, eps):
+        mod = _load_module()
+
+        x_c = x.contiguous()
+        gamma_c = gamma.contiguous()
+        beta_c = beta.contiguous()
+
+        y, mean, inv_std = mod.layernorm_forward(x_c, gamma_c, beta_c, float(eps))
+        ctx.save_for_backward(x_c, gamma_c, mean, inv_std)
+        return y
 
     @staticmethod
-    def backward(ctx, G):
-        X, gamma = ctx.saved_tensors
-        dX, dgamma, dbeta = _bwd_module().layernorm_backward(
-            X, G.contiguous(), gamma, ctx.eps)
-        # 对应 forward 的 (X, gamma, beta, eps)
-        return dX, dgamma, dbeta, None
+    def backward(ctx, grad_y):
+        x, gamma, mean, inv_std = ctx.saved_tensors
+        mod = _load_module()
+
+        grad_y_c = grad_y.contiguous()
+        grad_x, grad_gamma, grad_beta = mod.layernorm_backward(
+            grad_y_c, x, gamma, mean, inv_std
+        )
+        return grad_x, grad_gamma, grad_beta, None
 
 
 def candidate(inputs, params):
-    """framework 候选契约：inputs={"X","gamma","beta"}, params={"eps"} -> Y。"""
-    return LayerNormFunction.apply(inputs["X"], inputs["gamma"], inputs["beta"],
-                                   params["eps"])
+    """Candidate implementation entrypoint required by framework.
+
+    Args:
+      inputs: {"X": [B,D], "gamma": [D], "beta": [D]}
+      params: {"eps": float}
+    """
+    eps = float(params.get("eps", 1.0e-5))
+    return _LayerNormFunction.apply(inputs["X"], inputs["gamma"], inputs["beta"], eps)
 
 
 def forward_only(inputs, params):
-    """仅前向（no autograd），供调试。"""
-    return _fwd_module().layernorm_forward(
-        inputs["X"], inputs["gamma"], inputs["beta"], float(params["eps"]))
+    """Convenience forward-only entrypoint."""
+    return candidate(inputs, params)
