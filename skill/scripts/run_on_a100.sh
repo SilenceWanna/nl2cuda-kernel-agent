@@ -26,12 +26,36 @@ JUMP="root@11.91.169.119"
 GPUBOX="wangzihe@11.127.49.134"
 
 ssh_a100() {   # 双跳 SSH 包装：$@ 为远程命令；stdin 透传（供 heredoc / tar）
-  ssh -i "$KEY" -o IdentitiesOnly=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new \
+  # ServerAlive*：远程无响应（网络断/跳板挂）时 ~180s 后主动断开，不让本地 ssh 无限阻塞。
+  # timeout 前缀：bench 在超大 N 上可能真卡死（远程进程还活着，keepalive 检测不到）——墙钟兜底，
+  #   杀本地 ssh→retry→最终 SSH_ERROR，不再让驱动器（WSL/Git Bash）无限冻结（WSL 冻结教训）。
+  #   NL2CUDA_REMOTE_TIMEOUT 调秒数(0=禁用)；timeout 不可用的精简环境自动跳过（裸跑）。
+  local pfx=()
+  if [ "${REMOTE_TIMEOUT:-0}" != "0" ] && command -v timeout >/dev/null 2>&1; then
+    pfx=(timeout "$REMOTE_TIMEOUT")
+  fi
+  "${pfx[@]+"${pfx[@]}"}" ssh -i "$KEY" -o IdentitiesOnly=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new \
+      -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
       -o "ProxyCommand=ssh -i $KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -W %h:%p $JUMP" \
       "$GPUBOX" "$@"
 }
+# 远程执行墙钟超时（秒，0=禁用）；bench 卡死时兜底断开，防驱动器无限阻塞。
+REMOTE_TIMEOUT="${NL2CUDA_REMOTE_TIMEOUT:-900}"
 
 emit() { echo "VERDICT=$1"; }   # 驱动器自身错误也用 VERDICT 表达，便于 agent 统一解析
+
+# ---- tar 解析（Windows Git Bash 的 /usr/bin/tar 常被杀软拦"Permission denied"→打包失败误报 SSH_ERROR）----
+# 依次探候选，取第一个 `--version` 能跑通的：env 覆盖 > PATH 上的 tar > Windows System32 自带 bsdtar
+# （Git Bash 走 /c/... 、WSL 走 /mnt/c/...）。全不通再回退裸 tar（让后续 tar czf 自己报错，不吞）。
+resolve_tar() {
+  local cand
+  for cand in "${NL2CUDA_TAR:-}" tar /c/Windows/System32/tar.exe /mnt/c/Windows/System32/tar.exe; do
+    [ -z "$cand" ] && continue
+    if "$cand" --version >/dev/null 2>&1; then echo "$cand"; return 0; fi
+  done
+  echo tar
+}
+TAR="$(resolve_tar)"
 
 # ---- 参数 ----
 CASE=""
@@ -158,7 +182,11 @@ PACK_LIST=("cases/$CASE")
 if [ "$SYNC_CLI" = "1" ]; then
   PACK_LIST+=("skill/scripts/verify_case.py" "skill/scripts/bench_case.py")
 fi
-tar czf "$PAYLOAD" -C "$WORKDIR" --exclude='__pycache__' --exclude='*.pyc' "${PACK_LIST[@]}" || { emit SSH_ERROR; exit 1; }
+"$TAR" czf "$PAYLOAD" -C "$WORKDIR" --exclude='__pycache__' --exclude='*.pyc' "${PACK_LIST[@]}" || {
+  echo "[run_on_a100] 打包失败（tar=$TAR）——Git Bash 自带 tar 常被杀软拦截；已试 System32 bsdtar 仍失败。" >&2
+  echo "[run_on_a100] 可设 NL2CUDA_TAR=/c/Windows/System32/tar.exe 手动指定，或 export PATH=\"/c/Windows/System32:\$PATH\"。" >&2
+  emit SSH_ERROR; exit 1;
+}
 
 # ---- (可选) --auto-gpu：挑显存占用最低的卡 ----
 if [ "$AUTO_GPU" = "1" ]; then
@@ -313,6 +341,12 @@ else
 fi
 REMOTE
 )"
+  RC=$?
+  # timeout 杀掉远程（124）：bench 真卡死——明确报，别混进"无 VERDICT"泛化重试信息（WSL 冻结教训）。
+  if [ "$RC" = "124" ]; then
+    echo "[run_on_a100] 远程执行超时 ${REMOTE_TIMEOUT}s 被强制断开（第 $attempt 次）——bench 疑在超大规模卡死；可设 NL2CUDA_REMOTE_TIMEOUT 调整。重试…" >&2
+    sleep 5; continue
+  fi
   # 拿到含 VERDICT 的输出即成功
   if echo "$RESULT" | grep -q '^VERDICT='; then break; fi
   echo "[run_on_a100] 远程无 VERDICT 输出（第 $attempt 次），重试…" >&2; sleep 5

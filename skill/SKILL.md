@@ -178,7 +178,17 @@ python skill/scripts/bench_case.py --case <name>
 | **数据依赖控制流**（top-k、argmax 选择）| 非规则 | 手写 warp 两阶段选择（非全排序）；reference 可用 `torch.topk` 原语但 **candidate 必须手写**；反向稀疏散回被选位置。⚠️别用 `torch.sort()[:,:k]` 全排序 O(DlogD) 当 baseline（弱 baseline 变种D）|
 | **间接寻址/非规则访存**（CSR SpMV、gather-heavy）| 访存不规则 | 手写融合 CSR kernel（gather+乘加一趟，省 index_select+scatter_add 的中间物化）；或 cuSPARSE（但通用路径 descriptor 固定开销大，反向常输）。实测 spmv 手写前5.97/反2.48 |
 
-> **识别本征边界——何时该停（16 形态实测的元经验，避免在打不赢的算子上空转轮次）**：
+> **⚙️ 形态分类 + "能否赢 torch.compile" 判据总纲（23 形态实测提炼——动工/优化前先据此预判,别在打不赢的形态空转）**：
+> **核心判据:candidate 能赢 torch.compile,当且仅当它做到以下之一**——① **访存比 baseline 更少**（融合省中间物化/避免多趟）；② **利用了 autograd/torch.compile 不知道的解析数学结构**（伴随系统/Φ 算子/稳定递推,反向常数量级优势）；③ **算术强度够高**让计算而非访存主导（大 reduce/点积/GEMM 融合尾）。三者都不占 → 打不过,认边界。
+> **五类形态（先归类,再定预期与策略）**：
+> 1. **稳赢区**（访存更少 或 解析结构）：距离(rbf)、点积(cosine)、exp规约(softmax_ce)、大分组reduce(GroupNorm)、scan/SSM(scan/linear_ssm/gated_ssm 用 cumsum/O(T)递推)、conv1d、间接寻址(spmv)、数据依赖采样(gridsample)、变长分段(segment_softmax)、逐元素融合链**反向**(geglu)、线性求解**反向**(tridiag/cholesky 反向=解伴随/Φ算子)。→ 放手做,前反向多能真赢。
+> 2. **擦线区**（小 reduce,算术强度勉强）：LayerNorm/RMSNorm(D~1K)/l2norm/welford/temperature_softmax 前向。float4+寄存器缓存或能擦 1.0~1.1,但**多规模易掉**,须 3 连 + 计算主导区验（§29 多个被拆穿是短核虚高）。见好就收,别硬堆。
+> 3. **带宽墙区**（纯访存低算术强度前向）：maxpool 前向(读4写1)、geglu 前向(逐元素)、上述小 reduce 归一化前向。candidate 访存量=baseline、达峰值带宽 → **本征打不过,认边界**（非失败）。**反向常仍可赢**（有 Jacobian/散回/融合结构）。
+> 4. **厂商库墙区**（前向 baseline 就是 NVIDIA 厂商成品:cuSOLVER/cuBLAS 大 GEMM/cuFFT）：cholesky 前向(cuSOLVER potrf)。手写分块极难赢厂商库 → **认边界,手写尽力(可用 GEMM/TRSM 积木)+ 诚实报**。⚠️**禁直调同款库成品算子假装赢**（红线§1,potrf/getrf/cuFFT 直调=抄 baseline）。**反向若有解析结构（Φ算子）仍可能小胜**(cholesky 反 1.25)。
+> 5. **宿主分层区**（融合密集,考验 kernel 实现力,非 skill 边界）：GEMM+bias+gelu、online_softmax、causal_attn。→ codex 类强宿主能赢、中弱宿主可能挂,是**实现力**差异（同 case 有宿主赢有宿主输,区别于三宿主一致卡的本征边界）。
+> **元规律:反向常比前向好赢**——前向多是搬运(带宽墙),反向常含 Jacobian/伴随系统/多超越函数/列规约等**解析结构或计算**,candidate 能省 torch.compile 机械反传的多趟物化（geglu/tridiag/cholesky/segment 反向都印证）。但**别默认"反向总能赢"**——低算术强度整行归一化(LayerNorm/welford)反向也撞带宽墙。
+
+> **识别本征边界——何时该停（23 形态实测的元经验，避免在打不赢的算子上空转轮次）**：
 > - **带宽墙区（纯访存低算术强度算子的前向）**：如 2×2 maxpool 前向（读4写1）、逐元素归一化前向——`torch.compile` 融合已到**显存带宽上限**，candidate 无论怎么写都难超 5%。**判据**：profile 显示 kernel 已达带宽上限、candidate 与 baseline 访存量相同且都接近峰值带宽 → 认清是**算法本征无前向优化空间**（非 skill/agent 失败），别再烧轮次。maxpool 三宿主前向一致过不了（1.03/0.998/1.02）即铁证。**反向常仍可赢**（有 argmax 散回等可优化结构）。
 > - **归一化/reduce 家族前向——由 reduce 规模/算术强度分野（18 形态+§29 系统重估实测）**：
 >   - **小 reduce（整行/单行，规约元素 ~1K）→ 低算术强度，多为带宽墙**：LayerNorm/RMSNorm(D=1024)/l2norm_scale/welford/temperature_softmax 前向，每输出规约量小、逐元素为主，`torch.compile` 融合已达显存带宽上限。**多数在计算主导区打不过**（candidate 追平 baseline 即峰值带宽 80%+）——**LayerNorm 实测坐实带宽墙**（前反向放大规模均掉破 1.05，寄存器缓存省第二遍 X 读实测无感 1.012→1.019，§29）。**短核规模的擦线 PASS 是固定开销虚高，非真达标**（须多规模交叉，见"规模挑选"）。
