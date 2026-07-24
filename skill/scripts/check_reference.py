@@ -133,6 +133,20 @@ def scan_kernels(root, case):
     kdir = os.path.join(root, "cases", case, "kernels")
     for cu in sorted(glob.glob(os.path.join(kdir, "*.cu"))):
         code = _strip_c_comments(_read(cu))
+        # 0. 直调厂商库"成品目标算子"检测（红线§1 细化,aider Cholesky 钻空子暴露）：
+        #    cuBLAS/cuSOLVER 作辅助原语(GEMM/TRSM/AXPY/scan 积木)合规,但直调"与 case 目标算子
+        #    语义等价的库成品"(分解/求解/变换整题甩给一次库调用)= candidate 就是 baseline 同款厂商
+        #    算法,失去"手写 kernel 跑赢"意义。扫这些成品级库函数名。
+        for pat, name in [
+            (r"cusolverDn[SDCZ](potrf|potrs|getrf|getrs|gesv|geqrf|orgqr|gesvd|syevd|potri)", "cuSOLVER 分解/求解成品(potrf/getrf/gesv/geqrf/gesvd 等)"),
+            (r"\bcufft(Exec|Plan)", "cuFFT 变换成品"),
+            (r"cublas[SDCZ]getrfBatched|cublas[SDCZ]getriBatched|cublas[SDCZ]matinvBatched", "cuBLAS batched 求逆/分解成品"),
+        ]:
+            if re.search(pat, code):
+                findings.append(("RED", "vendor-target-op",
+                                 f"{os.path.basename(cu)}: 疑似直调厂商库成品目标算子（{name}）——红线§1 细化:cuBLAS/cuSOLVER 只能作"
+                                 f"辅助原语(GEMM/TRSM/scan 积木自己拼算法),禁把整个待实现算子直接甩给一次库调用(=candidate 就是 baseline"
+                                 f"同款厂商算法,失去手写跑赢意义)。厂商库墙形态正解:手写尽力(可用 GEMM/TRSM 积木)+ 诚实报边界"))
         # 按 __global__ 切分 kernel 函数体，逐个查嵌套 for + 内层累加
         for km in re.finditer(r"__global__[\s\S]*?\{([\s\S]*?)\n\}", code):
             body = km.group(1)

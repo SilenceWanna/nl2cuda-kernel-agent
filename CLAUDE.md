@@ -24,7 +24,7 @@
 
 ## 防作弊红线（不可违反，详见 SKILL.md）
 
-1. 禁落回 `F.scaled_dot_product_attention`/`torch.nn.functional` 等高层算子。
+1. 禁落回 `F.scaled_dot_product_attention`/`torch.nn.functional` 等高层算子。**cuBLAS/cuSOLVER 等官方库只能作辅助原语（GEMM/TRSM/scan 积木,自己拼算法）;禁直调"与目标算子等价的库成品"（Cholesky 直调 cusolverDnSpotrf、解线性系统直调 getrf/gesv、FFT 直调 cuFFT 等）——那 candidate=baseline 同款厂商算法,失去手写跑赢意义。厂商库墙形态正解是手写尽力+诚实报边界。**
 2. `framework/` 只读（禁改验证器/计时器/协议）。
 3. 不降精度换速度（fp32、无 fast-math）。
 4. 交付 `.cu` 独立编译、无 torch 高层运行时依赖。

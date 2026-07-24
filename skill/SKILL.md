@@ -233,6 +233,7 @@ python skill/scripts/bench_case.py --case <name>
    （赢 torch.compile 靠融合省中间物化/额外 launch，是正当优势）；scan 用 CUB block scan → 合规；SpMV 用 cuSPARSE 或手写 CSR kernel → 合规
    （注意 cuSPARSE 通用路径有 descriptor/workspace 固定开销，反向常因此打不过 torch.compile 的融合 scatter——手写融合 kernel 通常更优）。
    **通用张量原语**（`torch.topk`/`torch.sort`/`torch.cumsum`/`torch.scatter_add`/`torch.index_select` 等）**在 reference 里允许**（它们是基础操作、非神经网络高层层算子），但 candidate 仍须手写 `.cu` 不得直接调这些 torch 原语糊弄；**神经网络层算子**（`F.*`/`nn.*`：max_pool/layer_norm/conv/sdpa/embedding 等）**reference 也禁**。
+   **⚠️ 库调用的"辅助原语 vs 直调目标算子"细分（Cholesky 实测暴露,aider 钻空子）**：cuBLAS/cuSOLVER/cuSPARSE 允许作**辅助原语**（通用运算积木:GEMM/TRSM/TRMM/AXPY/block-scan 等）——candidate 用它们**拼**出目标算法 + 手写融合/调度,赢在融合省物化,合规（如 GEMM+bias+gelu 用 cublasSgemm 拼 + 手写尾）。但**禁止直调"与 case 目标算子语义等价的库函数"**——即 candidate 若把整个待实现算子直接甩给一个库调用（Cholesky 直调 `cusolverDnSpotrf`、解线性系统直调 `getrf/getrs/gesv`、QR 直调 `geqrf`、SVD 直调 `gesvd`、FFT 直调 cuFFT 等）,那 candidate 就是 baseline 用的同款厂商算法,**失去"手写 kernel 跑赢 torch.compile"的全部意义**（等于抄 baseline、比的是同库调用开销）。**判据**：问"这个库调用是**积木**(还需自己拼算法)还是**成品**(直接就是本题答案)?"——成品级直调禁。实测：Cholesky 前向 aider `dlopen` 直调 `cusolverDnSpotrf`（potrf=Cholesky 分解本身）= 违规规避,虽因集成低效没赢也不算数;codex 用 cuBLAS TRSM/GEMM 拼分块 Cholesky = 合规（TRSM/GEMM 是积木,分块调度自己写）。**厂商库墙形态**（前向 baseline 就是 cuSOLVER/cuFFT 等厂商成品）本就难赢,正解是手写尽力 + 诚实报边界（见"识别本征边界"）,不是直调同款库假装赢。
 2. 禁止修改/绕过 `framework/` 下的验证器、计时器、协议（评测基座只读）。
 3. 禁止降精度换速度（除非算法描述本身指定低精度）。
 4. 交付 `.cu` 须能独立编译、无 torch 高层运行时依赖。

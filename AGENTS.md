@@ -55,7 +55,7 @@
 
 ## 防作弊红线（不可违反，详见 SKILL.md）
 
-1. 待测路径禁止落回 `F.scaled_dot_product_attention` / `torch.nn.functional` / `torch.matmul` / `torch.sparse.mm` 等 torch 高层算子。**但允许 CUDA 官方底层库**（cuBLAS/CUB/cuSPARSE——candidate 在自定义 `.cu` 里调它们+手写融合 kernel 合规，非回到 torch 高层）。**通用张量原语**（`torch.topk`/`sort`/`cumsum`/`scatter_add`/`index_select`）**reference 里允许**（基础操作非层算子），但 candidate 仍须手写 `.cu` 不得直接调糊弄；**神经网络层算子**（`F.*`/`nn.*`：max_pool/layer_norm/conv/sdpa/embedding）reference 也禁。
+1. 待测路径禁止落回 `F.scaled_dot_product_attention` / `torch.nn.functional` / `torch.matmul` / `torch.sparse.mm` 等 torch 高层算子。**但允许 CUDA 官方底层库**（cuBLAS/CUB/cuSPARSE——candidate 在自定义 `.cu` 里调它们+手写融合 kernel 合规，非回到 torch 高层）。**通用张量原语**（`torch.topk`/`sort`/`cumsum`/`scatter_add`/`index_select`）**reference 里允许**（基础操作非层算子），但 candidate 仍须手写 `.cu` 不得直接调糊弄；**神经网络层算子**（`F.*`/`nn.*`：max_pool/layer_norm/conv/sdpa/embedding）reference 也禁。**⚠️ 库调用"辅助原语 vs 直调目标算子"细分（Cholesky 实测,aider 钻空子）**：cuBLAS/cuSOLVER 只能作**辅助原语**（GEMM/TRSM/AXPY/scan 等积木,candidate 拼算法+手写调度）;**禁直调"与 case 目标算子语义等价的库成品"**（Cholesky 直调 `cusolverDnSpotrf`、解线性系统直调 `getrf/gesv`、QR `geqrf`、FFT cuFFT 等）——那 candidate 就是 baseline 同款厂商算法,失去"手写 kernel 跑赢"意义（等于抄 baseline）。判据:库调用是**积木**(还需拼)还是**成品**(直接是本题答案)——成品级直调禁。厂商库墙形态(baseline 就是 cuSOLVER/cuFFT)正解是手写尽力+诚实报边界,非直调同库假装赢。
 2. `framework/` 只读——禁止修改/绕过验证器、计时器、协议。
 3. 禁止降精度换速度（保持 fp32、不用 fast-math）。
 4. 交付 `.cu` 须能独立编译、无 torch 高层运行时依赖。
